@@ -44,6 +44,11 @@ cmd_nmap :: proc(s: ^Session, cmd: ^Command) {
 		depth = .Version
 	}
 
+	// -T2 is the loud-fast/quiet-slow choice in one flag: roughly three and a
+	// half times as long for a third of the attention. It is what makes
+	// backgrounding a scan worth doing.
+	slow := has_flag(cmd, "T2", "t2")
+
 	// Gather targets first so the whole scan can be scheduled up front. Only
 	// hosts in segments we can actually reach respond -- segmentation is the
 	// map, so a scan that ignored it would erase the game's central constraint.
@@ -64,13 +69,29 @@ cmd_nmap :: proc(s: ^Session, cmd: ^Command) {
 	}
 
 	per_host := sim.seconds(depth == .Ping ? 0.45 : (depth == .Ports ? 0.75 : 1.05))
+	if slow {
+		per_host = scale_time(per_host)
+	}
+
+	// Charged once per segment, not once per host: a sweep of a /24 pays for
+	// one scan of that segment. Filed for every segment the scan actually
+	// reached, so a scan spanning two reachable segments pays in both.
+	units := depth == .Ping ? NOISE_NMAP_PING : (depth == .Ports ? NOISE_NMAP_PORTS : NOISE_NMAP_VERSION)
+	if slow {
+		units = max(units / T2_NOISE_DIV, 1)
+	}
+	// A scan that reached nothing is free: you have no route, so nothing of
+	// theirs saw a packet. There is also no segment to bill.
+	for h in hits {
+		touched(s, h, units)
+	}
 
 	// Provisional: the real end is only known once the per-host output has been
 	// laid out below, and is set with work_ends_at afterwards.
 	begin_work(s, sim.seconds(1.1) + per_host * sim.Tick(max(len(hits), 1)), "nmap")
 	out(s, "Starting Nmap 7.94 ( simulated )", .Plain)
 
-	t := sim.seconds(0.9)
+	t := slow ? scale_time(sim.seconds(0.9)) : sim.seconds(0.9)
 	for h in hits {
 		host, _ := sim.pool_get(&s.world.hosts, h)
 		buf: [15]u8
@@ -78,17 +99,17 @@ cmd_nmap :: proc(s: ^Session, cmd: ^Command) {
 
 		out_at(s, t, fmt.tprintf("Nmap scan report for %s", addr_str), .Heading)
 		act_at(s, t, sim.Act_Discover_Host{host = h})
-		t += sim.seconds(0.2)
+		t += slow ? scale_time(sim.seconds(0.2)) : sim.seconds(0.2)
 
 		if depth == .Ping {
 			out_at(s, t, "Host is up.", .Plain)
-			t += per_host - sim.seconds(0.2)
+			t += per_host - (slow ? scale_time(sim.seconds(0.2)) : sim.seconds(0.2))
 			continue
 		}
 
 		if len(host.services) == 0 {
 			out_at(s, t, "All 1000 scanned ports are closed", .Info)
-			t += per_host - sim.seconds(0.2)
+			t += per_host - (slow ? scale_time(sim.seconds(0.2)) : sim.seconds(0.2))
 			continue
 		}
 
@@ -112,12 +133,12 @@ cmd_nmap :: proc(s: ^Session, cmd: ^Command) {
 				act_at(s, t, sim.Act_Discover_Service{host = h, index = idx})
 			}
 		}
-		t += sim.seconds(0.15)
+		t += slow ? scale_time(sim.seconds(0.15)) : sim.seconds(0.15)
 	}
 
 	// The summary must land after the last result, so it is scheduled from the
 	// cursor the loop actually reached rather than from the estimate.
-	t += sim.seconds(0.25)
+	t += slow ? scale_time(sim.seconds(0.25)) : sim.seconds(0.25)
 	summary := fmt.tprintf(
 		"Nmap done: %d IP address%s scanned, %d host%s up",
 		addresses_in(mask),
@@ -127,6 +148,14 @@ cmd_nmap :: proc(s: ^Session, cmd: ^Command) {
 	)
 	out_at(s, t, summary, .Plain)
 	work_ends_at(s, t)
+}
+
+// Every cursor step in cmd_nmap's scheduling body goes through this, not just
+// the up-front estimate: work_ends_at overwrites the estimate with the real
+// cursor, so scaling only begin_work would have had no effect at all.
+@(private)
+scale_time :: proc(t: sim.Tick) -> sim.Tick {
+	return t * sim.Tick(T2_TIME_NUM) / sim.Tick(T2_TIME_DEN)
 }
 
 @(private)
@@ -179,6 +208,9 @@ cmd_curl :: proc(s: ^Session, cmd: ^Command) {
 		}
 	}
 	if !serving {
+		// You reached the box and it refused you -- that is a line in someone's
+		// log, and louder than a request that worked.
+		touched(s, h, NOISE_CURL_FAILED)
 		out(s, fmt.tprintf("curl: (7) Failed to connect to %s port 80: Connection refused", target), .Bad)
 		return
 	}
@@ -192,9 +224,11 @@ cmd_curl :: proc(s: ^Session, cmd: ^Command) {
 
 	index, found := sim.host_file_index(host, full)
 	if !found {
+		touched(s, h, NOISE_CURL_FAILED) // a 404 in their access log
 		out_at(s, sim.seconds(0.9), fmt.tprintf("curl: (22) The requested URL returned error: 404"), .Bad)
 		return
 	}
+	touched(s, h, NOISE_CURL)
 
 	// Iterate a local copy: split_lines_iterator advances the string it is
 	// given, so passing the stored field would consume the file and leave every
@@ -278,12 +312,15 @@ cmd_ssh :: proc(s: ^Session, cmd: ^Command) {
 	begin_work(s, sim.seconds(matched ? 1.6 : 2.4), "ssh")
 
 	if !matched {
-		// Failure is slower than success, as a real login is: the delay is the
-		// target deciding you are wrong. It will also be much louder than a
-		// success once trace exists.
+		// A failed login is a line in their auth log; a successful one is just a
+		// login. Four times the noise, and slower too -- the delay is the target
+		// deciding you are wrong.
+		touched(s, h, NOISE_SSH_FAILED)
 		out_at(s, sim.seconds(2.2), fmt.tprintf("%s@%s: Permission denied (publickey,password).", user, target), .Bad)
 		return
 	}
+
+	touched(s, h, NOISE_SSH)
 
 	level := account.is_admin ? sim.Access.Root : sim.Access.User
 	out_at(s, sim.seconds(0.8), fmt.tprintf("%s@%s's password: ", user, target), .Info)
@@ -291,11 +328,9 @@ cmd_ssh :: proc(s: ^Session, cmd: ^Command) {
 	act_at(s, sim.seconds(1.5), sim.Act_Grant_Access{host = h, level = level})
 	out_at(s, sim.seconds(1.6), fmt.tprintf("Last login: never  --  %s", host.os_name), .Info)
 
-	// The prompt itself moves once the command completes; see session_update.
-	s.pending_move = Move {
-		host = h,
-		user = strings.clone(user, s.world.allocator),
-	}
+	// The prompt moves once the job completes; see session_update. Held on the
+	// job, so interrupting the login drops the move with it.
+	set_pending_move(s, h, user)
 }
 
 // Accepts an address or a hostname. Hostnames only resolve for hosts already

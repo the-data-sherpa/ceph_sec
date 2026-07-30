@@ -3,8 +3,8 @@
 The reference the remaining milestones build toward. Entries marked ✅ are
 implemented; everything else is intent, not implementation.
 
-Noise values are documented targets — the trace system that consumes them
-arrives in M2, so nothing charges for noise yet.
+Noise values marked ✅ are the tuned figures actually in use; the rest are
+targets for tools that do not exist yet.
 
 ---
 
@@ -107,9 +107,11 @@ and the segment you need is the one that notices you.
 
 ---
 
-## 5. Trace and detection
+## 5. Trace and detection ✅
 
-Two coupled numbers.
+Two coupled numbers. Implemented in `src/sim/trace.odin`; every quantity is an
+integer in hundredths, because a float here would put the determinism guarantee
+at the mercy of the optimiser.
 
 **Suspicion** is per-segment and rises with the noise of actions taken inside
 it, scaled by that segment's monitoring. It decays while you're quiet. Failed
@@ -124,10 +126,30 @@ Escalating defender responses, so pressure is felt before it's fatal:
 
 | Trace | Response |
 | --- | --- |
-| 25% | log review — recent noisy actions get re-examined; some hosts harden |
-| 50% | alert — credentials rotate, sessions start dropping |
-| 75% | active hunt — a defender walks the network, killing footholds |
+| 25% | log review — every segment you have been noisy in raises its monitoring one step, so everything you do from here costs more |
+| 50% | alert — you are kicked off the box you hold in the hottest segment, and *that host's* passwords rotate |
+| 75% | active hunt — a defender takes one foothold every 20s, newest first, and never your own box |
 | 100% | attribution — run over |
+
+**The 50% response is deliberately narrow.** Rotating "the credential you are
+relying on" would, in a scenario where one reused password *is* the attack path,
+make the objective permanently unreachable — silently, with no `Stranded`
+outcome to detect it. Rewriting passwords on a box you already hold cannot brick
+anything: the credential still opens everything you have not reached, and you
+route around the loss.
+
+**Tuned figures.** Alarm line 60.00; suspicion decays 1.20/s after 5s of quiet;
+excess above the line converts to trace at `excess / 2048` per tick. A segment
+held at 80.00 burns a run in under three minutes; one at 62.00 takes nearly half
+an hour. A *burst* of noise is survivable — decay pulls you back under within
+seconds — but the trace it bought never comes back, so bursts accumulate.
+
+**Being caught is always attributable, mechanically.** The trace cannot rise
+while every segment is below the alarm line, so a lost run always traces back to
+a named segment that sat visibly over a visible line for a recorded number of
+seconds. The end-of-run debrief prints exactly that, along with the loudest
+charges and the command lines responsible. There is a test asserting that ten
+simulated minutes of sub-threshold noise leaves the trace at exactly zero.
 
 **Corollary that makes offline work valuable:** cracking hashes, reading
 captured traffic and `searchsploit` are *free*, because they don't touch the
@@ -147,7 +169,7 @@ values to tune, not commitments.
 | --- | --- | --- | --- |
 | `nmap -sn` ✅ | host discovery, no ports | 6s | 8 |
 | `nmap -sV` ✅ | versions — the good stuff | 14s | 22 |
-| `nmap -sS -T2` | same, slow and quiet | 50s | 6 |
+| `nmap -sV -T2` ✅ | same, ~3.5x slower for a third of the noise | ~18s | 7 |
 | `tcpdump` | passive; yields creds/hosts over time | passive | 0 |
 | `arp -a` | neighbours, from a held host | 1s | 1 |
 
@@ -157,7 +179,7 @@ values to tune, not commitments.
 
 | Tool | Effect | Time | Noise |
 | --- | --- | --- | --- |
-| `curl` ✅ | fetch a page or file from a web root | 1.1s | 10 |
+| `curl` ✅ | fetch a page or file from a web root | 1.1s | 10 / 20 failed |
 | `gobuster` | web paths | 20s | 25 |
 | `enum4linux` | SMB shares, users | 12s | 18 |
 | `searchsploit` | vulns for seen versions — **offline** | 1s | 0 |
@@ -182,6 +204,7 @@ point is *discoverable* rather than guessable.
 
 | Tool | Effect | Time | Noise | Requires |
 | --- | --- | --- | --- | --- |
+| `cat` (sensitive) ✅ | file auditing on material that matters | 0s | 6 | user |
 | `mimikatz` | dump credentials from memory | 5s | 40 | SYSTEM |
 | `hashcat` | crack dumped hashes — **offline** | 60s+ | 0 | — |
 | `linpeas` | local privesc paths | 10s | 8 | user |
@@ -194,7 +217,7 @@ number, and it can make things worse.
 
 ---
 
-## 7. Jobs
+## 7. Jobs ✅
 
 Anything slow is a **Job**: it occupies a slot, reports progress, streams output
 into the terminal as it goes, and can be backgrounded or killed. The prompt
@@ -204,6 +227,19 @@ upgrade.
 This is where real-time earns its place — deciding what to run *while* the
 hydra job grinds is the moment-to-moment game. Jobs are scheduled in ticks
 against the sim clock, so none of it costs determinism.
+
+Implemented in `src/shell/job.odin`. A job's identity is the timer tag the
+scheduler has grouped output under since M0, so `kill %1` and `^C` are a single
+`cancel_tag` call. Its *liveness* is a pure function of `w.now` rather than a
+latched flag — a latch would make "is the prompt free at tick T" depend on where
+the frame boundaries fell, which would silently break reproducibility. A test
+drives an identical session one tick at a time and seven ticks at a time and
+requires byte-identical output.
+
+**Noise is charged at dispatch, in full, and never refunded.** The packets left
+when you pressed Enter. It also removes "start everything loud, watch the meter,
+kill what looks bad" as a strategy: cancelling buys back time and a slot, not
+attention. `kill` says so the first time you use it.
 
 ---
 

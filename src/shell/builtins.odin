@@ -92,12 +92,72 @@ cmd_creds :: proc(s: ^Session, cmd: ^Command) {
 	}
 }
 
+// Free, and offline in the strict sense: it reports what you have already
+// caused. Nothing here touches a target.
+cmd_trace :: proc(s: ^Session, cmd: ^Command) {
+	w := s.world
+
+	out(s, fmt.tprintf("trace  %.1f%%", f32(w.trace.level) / 100), w.trace.level > 0 ? .Trace : .Info)
+	out(s, "", .Plain)
+	out(s, "segment      watch    suspicion", .Info)
+
+	it: int
+	for sn, h in sim.pool_iter(&w.subnets, &it) {
+		// Segments you have never reached are not information you have.
+		if !sim.subnet_reachable(w, h) && sn.suspicion == 0 {
+			continue
+		}
+
+		bar := meter(sn.suspicion, sim.SUSPICION_MAX, 12)
+		level: sim.Log_Level = .Data
+		flag := ""
+		if sn.suspicion > sim.SUSPICION_ALARM {
+			level = .Bad
+			flag = "  ALARM"
+		} else if sn.suspicion > sim.SUSPICION_ALARM / 2 {
+			level = .Warn
+		}
+
+		out(
+			s,
+			fmt.tprintf(
+				"%-12s %-8s %s %5.1f%s",
+				sn.name,
+				sim.monitoring_label(sn.monitoring),
+				bar,
+				f32(sn.suspicion) / 100,
+				flag,
+			),
+			level,
+		)
+	}
+
+	out(s, "", .Plain)
+	out(
+		s,
+		fmt.tprintf("the trace advances only while a segment is above %.0f.", f32(sim.SUSPICION_ALARM) / 100),
+		.Info,
+	)
+}
+
+@(private)
+meter :: proc(value, max_value: i32, width: int) -> string {
+	filled := int(i64(value) * i64(width) / i64(max(max_value, 1)))
+	filled = clamp(filled, 0, width)
+	sb := strings.builder_make(context.temp_allocator)
+	for i in 0 ..< width {
+		strings.write_string(&sb, i < filled ? "#" : ".")
+	}
+	return strings.to_string(sb)
+}
+
 cmd_exit :: proc(s: ^Session, cmd: ^Command) {
 	// Leaving a pivoted shell drops you back to the box you came from; leaving
-	// the origin quits. Tracking the chain properly is M2 work alongside job
-	// control -- for now, exiting anywhere but origin returns to origin.
+	// the origin ends the run. Tracking the full shell chain is still M4 work --
+	// for now, exiting anywhere but origin returns to origin.
 	if s.host == s.world.origin {
-		s.should_quit = true
+		jobs_kill_all(s)
+		sim.end_run(s.world, .Quit)
 		return
 	}
 	session_move_to(s, s.world.origin, "operator")
@@ -106,11 +166,34 @@ cmd_exit :: proc(s: ^Session, cmd: ^Command) {
 
 // --- filesystem -------------------------------------------------------------
 
+// True if the prompt is standing somewhere it no longer has any right to be.
+// session_update normally evicts you first; this is the second lock on the door,
+// because reading the objective off a box they have already kicked you from
+// would make the hunt cosmetic.
+@(private)
+lost_the_host :: proc(s: ^Session) -> bool {
+	if s.host == s.world.origin {
+		return false
+	}
+	host, ok := sim.pool_get(&s.world.hosts, s.host)
+	if !ok {
+		return true
+	}
+	if host.access == .None {
+		out(s, "Connection closed by remote host.", .Bad)
+		return true
+	}
+	return false
+}
+
 cmd_pwd :: proc(s: ^Session, cmd: ^Command) {
 	out(s, s.cwd)
 }
 
 cmd_cd :: proc(s: ^Session, cmd: ^Command) {
+	if lost_the_host(s) {
+		return
+	}
 	h, ok := sim.pool_get(&s.world.hosts, s.host)
 	if !ok {
 		return
@@ -138,6 +221,9 @@ cmd_cd :: proc(s: ^Session, cmd: ^Command) {
 }
 
 cmd_ls :: proc(s: ^Session, cmd: ^Command) {
+	if lost_the_host(s) {
+		return
+	}
 	h, ok := sim.pool_get(&s.world.hosts, s.host)
 	if !ok {
 		return
@@ -200,6 +286,9 @@ entry_line :: proc(name: string, size: int, long: bool) -> string {
 }
 
 cmd_cat :: proc(s: ^Session, cmd: ^Command) {
+	if lost_the_host(s) {
+		return
+	}
 	h, ok := sim.pool_get(&s.world.hosts, s.host)
 	if !ok {
 		return
@@ -228,6 +317,13 @@ cmd_cat :: proc(s: ^Session, cmd: ^Command) {
 	body := f.content
 	for line in strings.split_lines_iterator(&body) {
 		out(s, line)
+	}
+
+	// The one place a builtin costs attention. Reading the material that
+	// actually matters trips file auditing -- and without it the last third of
+	// a run, including taking the objective, would be completely silent.
+	if f.sensitive {
+		touched(s, s.host, NOISE_READ_SENSITIVE)
 	}
 
 	// Reading a config file is how credentials enter play. Harvesting happens

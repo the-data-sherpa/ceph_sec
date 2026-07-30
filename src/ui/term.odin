@@ -106,7 +106,7 @@ term_draw_input :: proc(
 	prompt: string,
 	text: string,
 	cursor: int,
-	busy: bool,
+	held: bool,
 	blink_on: bool,
 	bg: Color_Id = .Bg_Panel,
 ) {
@@ -115,14 +115,11 @@ term_draw_input :: proc(
 	}
 	grid_fill(g, x, y, w, 1, ' ', .Text, bg)
 
-	// A busy terminal shows the prompt dimmed and no cursor: the shell is not
-	// listening, and the display should say so rather than invite typing.
-	prompt_color: Color_Id = busy ? .Dim : .Good
-	end := grid_write(g, x, y, prompt, prompt_color, bg, busy ? {} : Attrs{.Bold})
-
-	if busy {
-		return
-	}
+	// A foreground job dims the prompt to say the next command will be refused --
+	// but the line and cursor still draw, because the editor is still live. You
+	// can type ahead, and you can always run a builtin.
+	prompt_color: Color_Id = held ? .Dim : .Good
+	end := grid_write(g, x, y, prompt, prompt_color, bg, held ? {} : Attrs{.Bold})
 
 	avail := w - (end - x)
 	if avail <= 0 {

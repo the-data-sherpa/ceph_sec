@@ -16,7 +16,17 @@ Subnet :: struct {
 	base:      Addr,
 	mask_bits: u8,
 	hosts:     [dynamic]Handle(Host),
-	scanned:   bool,
+
+	// How closely this segment is watched, and how much attention you have
+	// drawn in it. See trace.odin. Suspicion is per-segment because that is
+	// what makes noise a *local* cost -- being loud in the DMZ should not
+	// endanger you in CORP, and the difference is the whole reason to care
+	// which segment you are standing in.
+	monitoring:     Monitoring,
+	suspicion:      i32,  // hundredths, 0 ..= SUSPICION_MAX
+	last_charge_at: Tick, // decay waits SUSPICION_GRACE past this
+	hot_ticks:      Tick, // total time spent above the alarm line, for the debrief
+	alarmed:        bool, // edge latch, so crossing the line announces once
 }
 
 subnet_contains :: proc(s: ^Subnet, a: Addr) -> bool {

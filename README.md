@@ -10,10 +10,11 @@ can't**: the simulation package is mechanically forbidden from importing any I/O
 platform, or vendor package, and `./build.sh gate` fails the build if that ever
 changes.
 
-> **Status: milestone 1 — the terminal works.** You can type into it. A short
-> run is playable end to end: scan the DMZ, find an exposed `.env`, reuse the
-> password it leaks to take the jump box, pivot into the internal segment and
-> recover the objective. No trace pressure or background jobs yet — those are M2.
+> **Status: milestone 2 — the run can be lost.** Commands run in the background
+> with `&` while the prompt stays live, and the network now notices you: every
+> action costs attention in the segment it touches, and sustained noise brings a
+> log review, credential rotation, someone hunting your footholds, and finally
+> attribution. Win by recovering the objective; lose by being loud.
 
 ## Setup
 
@@ -43,9 +44,16 @@ and honours `ODIN=` if it lives elsewhere.
 ./build.sh all        # check + test + build
 ```
 
-While running, type `help`. `^C` interrupts a running command, `PgUp`/`PgDn`
-scroll, and `↑`/`↓` walk history. Display: `F1` CRT on/off · `F2` curved/flat ·
-`F3` theme · `F12` screenshot · `ESC` quit.
+While running, type `help`. Suffix a command with `&` to background it, then
+`jobs` / `fg` / `kill` to manage it, and `trace` to see how much attention you
+have drawn. `^C` interrupts the foreground command, `PgUp`/`PgDn` scroll, `↑`/`↓`
+walk history. Display: `F1` CRT on/off · `F2` curved/flat · `F3` theme · `F12`
+screenshot · `ESC` quit.
+
+```
+nmap -sV -T2 10.0.4.0/24 &     a slow, quiet scan, running in the background
+curl http://10.0.4.11/.env     ...while you work on something else
+```
 
 ```sh
 ./build/cephsec --shot 12.5 frame.png            # run to a tick, capture, exit
@@ -65,8 +73,8 @@ are not honoured.
 A directory is a package in Odin, and imports may only point downward.
 
 ```
-src/sim/     simulation core — world, scheduler, events. Pure and deterministic.
-src/shell/   parsing, commands, tools. Pure — nmap and ssh live here.
+src/sim/     simulation core — world, scheduler, events, trace. Pure, deterministic.
+src/shell/   parsing, commands, jobs, tools. Pure — nmap and ssh live here.
 src/input/   shared key vocabulary. No dependencies at all.
 src/ui/      character grid, terminal, CRT pipeline — the only raylib consumer
 src/main.odin  wires them together, owns the frame loop and the scenario
@@ -94,6 +102,14 @@ to retrofit once tools and gameplay exist.
    wall-clock delta into whole ticks. Same seed and tick count means a
    byte-identical world, which is what makes seeds shareable and replays real.
 
+   Concurrency does not weaken this. There are no threads — background jobs are
+   timers interleaving on the tick loop, and the purity gate's ban on
+   `core:thread` is what guarantees it stays that way. Anything that gates a
+   decision is a pure function of `w.now` rather than a latched flag, so the
+   tick a command dispatches on cannot depend on the frame rate. All trace
+   arithmetic is integer, with the sub-divisor remainder carried between ticks,
+   so batching cannot change a total.
+
 The PRNG (PCG32) is hand-rolled rather than taken from `core:math/rand` for the
 same reason: `core:math/rand` may change algorithm between Odin releases, which
 would silently invalidate every seed ever shared without breaking a build.
@@ -105,7 +121,7 @@ would silently invalidate every seed ever shared without breaking a build.
 | --- | --- |
 | **M0** | engine foundation — sim core, scheduler, events, CRT pipeline ✅ |
 | **M1** | terminal input, command parser, first tools ✅ |
-| M2 | async jobs and trace pressure — the run becomes losable |
+| **M2** | background jobs and trace pressure — the run becomes losable ✅ |
 | M3 | procedural network generation with attack-graph solvability proof |
 | M4 | net map, exfil objectives, run-end |
 | M5 | meta-progression between runs |
