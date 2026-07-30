@@ -51,6 +51,7 @@ COMMANDS := []Command_Spec {
 	{name = "play", offline = true, category = .Campaign, usage = "play [n]", summary = "start a level", run = cmd_play},
 	{name = "retry", offline = true, category = .Campaign, usage = "retry", summary = "restart this level", run = cmd_retry},
 	{name = "objectives", offline = true, category = .Campaign, usage = "objectives", summary = "show this level's goals", run = cmd_objectives},
+	{name = "hint", offline = true, category = .Campaign, usage = "hint", summary = "reveal the next nudge", run = cmd_hint},
 	{name = "techniques", offline = true, category = .Campaign, usage = "techniques", summary = "show ATT&CK coverage", run = cmd_techniques},
 
 	{name = "help", offline = true, category = .Builtin, usage = "help [command]", summary = "list commands, or explain one", run = cmd_help},

@@ -350,6 +350,30 @@ for the attack-graph prover that procedural generation would have needed:
 Each level's walkthrough doubles as its reference solution, so a design change
 shows up as a failing test with the objective named.
 
+### Hints
+
+A brief that ends "Try: nmap -sn 10.0.4.0/24" hands over the whole level; one
+that says nothing strands people, which is exactly how the combine level failed
+its first player. Hints break that trade: briefs name the goal and the tool,
+and the invocation lives behind `hint`.
+
+One ordered list per level rather than a set per objective, because a level's
+objectives are steps of one chain and its hints are one narrative. Each hint
+declares the step it unblocks, so `hint` skips forward past anything already
+solved -- being told to do something you did ten minutes ago teaches nothing.
+A hint is one complete thought, however many lines it takes; the array is a
+list of hints, not of lines.
+
+Never penalised. The debrief notes an unaided finish as a quiet reward, and
+that is the whole reward. There is no separate difficulty setting because
+opt-in help already is one.
+
+The guarantee is that a player can never be hard-stuck, and it is checked
+dynamically: walk each level, and at every point short of completion assert
+that `hint` still has something to say about what remains. Checking it
+statically -- "every objective has a hint" -- is the wrong rule, because
+several objectives are often satisfied by one action.
+
 ### The honest limits
 
 ATT&CK is a taxonomy of observed adversary behaviour, not a syllabus. Much of

@@ -35,6 +35,12 @@ LEVEL_ACCESS_EXPOSURE := Level {
 		{text = "Read the published page", goal = Goal_Read_File{"portal", "/var/www/html/index.html"}},
 		{text = "Obtain a credential", goal = Goal_Obtain_Credential{"deploy"}},
 	},
+	hints = {
+		{0, {"Start the same way as always: find out what is there and", "what it is running. One host serves web pages."}},
+		{1, {"curl fetches a URL. The page itself is at the root:", "curl http://10.0.5.12/"}},
+		{2, {"Read the page source, not just the words on it. The", "developer left a note about a file they meant to move."}},
+		{2, {"That file is served like any other. Fetch it directly:", "curl http://10.0.5.12/.env"}},
+	},
 	debrief = Debrief {
 		what = {
 			"You read a credential straight out of a published file:",
@@ -127,6 +133,14 @@ LEVEL_LATERAL_REUSE := Level {
 		{text = "Obtain the service credential", goal = Goal_Obtain_Credential{"svc-backup"}},
 		{text = "Log in to the host it belongs to", goal = Goal_Access{"portal", .User}},
 		{text = "Reuse it on the backup server", goal = Goal_Access{"backup01", .User}},
+	},
+	hints = {
+		{0, {"Same shape as the last level: scan, read the page, and", "follow what its source mentions."}},
+		{0, {"The page names a config file. Fetch it:", "curl http://10.0.6.12/backup.conf"}},
+		{1, {"You have a username and a password -- `creds` shows what", "you hold. ssh takes them as user@host."}},
+		{1, {"Run: ssh svc-backup@10.0.6.12"}},
+		{2, {"That is the machine the credential belongs to. The", "question is whether anything else accepts it."}},
+		{2, {"The config named where the backups go. Try that host:", "ssh svc-backup@10.0.6.40"}},
 	},
 	debrief = Debrief {
 		what = {

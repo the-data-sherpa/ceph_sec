@@ -27,12 +27,19 @@ LEVEL_RECON_SWEEP := Level {
 		"",
 		"Find out which addresses in 10.0.4.0/24 are actually live.",
 		"",
-		"Try: nmap -sn 10.0.4.0/24",
+		"nmap will do this. `help nmap` for its usage, `hint` if",
+		"you get stuck.",
 	},
 	objectives = {
 		{text = "Find the gateway", goal = Goal_Discover_Host{"gw-edge"}},
 		{text = "Find the web server", goal = Goal_Discover_Host{"web01"}},
 		{text = "Find the mail server", goal = Goal_Discover_Host{"mail01"}},
+	},
+	hints = {
+		{HINT_ANY, {"You are looking for which addresses answer, not what", "they are running. That is the cheaper question."}},
+		{0, {"nmap takes a whole range at once: 10.0.4.0/24 means all", "256 addresses. `help nmap` lists its flags."}},
+		{0, {"The flag for a host sweep -- addresses only, no ports --", "is -sn."}},
+		{0, {"Run: nmap -sn 10.0.4.0/24"}},
 	},
 	debrief = Debrief {
 		what = {
@@ -110,6 +117,11 @@ LEVEL_RECON_VERSIONS := Level {
 		{text = "Identify the web service on app01", goal = Goal_Discover_Service{"app01", 8080}},
 		{text = "Identify the database on db01", goal = Goal_Discover_Service{"db01", 5432}},
 		{text = "Identify the file share on files01", goal = Goal_Discover_Service{"files01", 445}},
+	},
+	hints = {
+		{HINT_ANY, {"-sn told you a host was up. It did not ask what the", "host was, which is what you need now."}},
+		{0, {"There is a flag that probes each open port to work out", "the software and version behind it."}},
+		{0, {"Run: nmap -sV 10.0.7.0/24"}},
 	},
 	debrief = Debrief {
 		what = {

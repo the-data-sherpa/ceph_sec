@@ -42,6 +42,12 @@ Session :: struct {
 	level:    ^campaign.Level,
 	progress: ^campaign.Progress,
 
+	// How many hints have been revealed this attempt, and how many in total.
+	// The count is what the debrief reports; it carries no penalty, because
+	// charging someone for learning is backwards in a teaching game. Reset by
+	// session_init, so a retry starts clean.
+	hints_shown: int,
+
 	// Which tools this level makes available. Narrower than what the player has
 	// unlocked: a level can withhold something you own.
 	tools: []string,
@@ -75,6 +81,7 @@ session_init :: proc(s: ^Session, w: ^sim.World, host: sim.Handle(sim.Host), use
 	s.cur = 0
 	s.jobs = {}
 	s.charge_count = 0
+	s.hints_shown = 0
 	s.hinted_kill = false
 	line_init(&s.line, w.allocator)
 }

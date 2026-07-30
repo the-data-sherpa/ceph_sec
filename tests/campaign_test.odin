@@ -307,6 +307,69 @@ test_every_level_has_its_teaching_content :: proc(t: ^testing.T) {
 	}
 }
 
+// --- hints ------------------------------------------------------------------
+
+// Note: "every objective has its own hint" is deliberately NOT the rule. Level
+// one's three objectives are all satisfied by a single sweep, so a hint per
+// objective would mean writing three hints for one action. The promise that
+// actually matters -- while a level is unfinished, `hint` has something useful
+// to say -- is checked dynamically in playthrough_test.odin, by walking each
+// level and asking at every incomplete point.
+
+@(test)
+test_hints_are_well_formed :: proc(t: ^testing.T) {
+	for &l in campaign.LEVELS {
+		for h, i in l.hints {
+			testing.expectf(t, len(h.lines) > 0, "level %q hint %d has no text", l.id, i)
+			for line in h.lines {
+				testing.expectf(t, len(line) > 0, "level %q hint %d has an empty line", l.id, i)
+				// Two cells narrower than the pane: hints are indented.
+				testing.expectf(
+					t,
+					len(line) <= 60,
+					"level %q hint %d line is %d cells, over the pane: %q",
+					l.id,
+					i,
+					len(line),
+					line,
+				)
+			}
+			testing.expectf(
+				t,
+				h.unblocks == campaign.HINT_ANY || (h.unblocks >= 0 && h.unblocks < len(l.objectives)),
+				"level %q hint %d points at objective %d, which does not exist",
+				l.id,
+				i,
+				h.unblocks,
+			)
+		}
+	}
+}
+
+// Hints escalate, so they must be ordered: a hint for step 3 appearing before
+// one for step 1 would be revealed first and give away the ending.
+@(test)
+test_hints_are_ordered_by_step :: proc(t: ^testing.T) {
+	for &l in campaign.LEVELS {
+		highest := -1
+		for h in l.hints {
+			if h.unblocks == campaign.HINT_ANY {
+				continue
+			}
+			testing.expectf(
+				t,
+				h.unblocks >= highest,
+				"level %d (%s): a hint for step %d comes after one for step %d -- hints must escalate in order",
+				l.number,
+				l.id,
+				h.unblocks,
+				highest,
+			)
+			highest = max(highest, h.unblocks)
+		}
+	}
+}
+
 // --- progress ---------------------------------------------------------------
 
 @(test)

@@ -203,6 +203,55 @@ cmd_objectives :: proc(s: ^Session, cmd: ^Command) {
 	}
 }
 
+// --- hints ------------------------------------------------------------------
+
+// Escalating help, on request only.
+//
+// This is what lets a brief state the goal without also handing over the
+// command. Someone who wants the challenge never types it; someone stuck gets a
+// nudge first and the answer only if they keep asking.
+//
+// Never penalised. The debrief notes a level finished without hints as a quiet
+// reward, but there is no noise cost and no score -- charging a learner for
+// learning would be backwards.
+cmd_hint :: proc(s: ^Session, cmd: ^Command) {
+	if s.level == nil {
+		out(s, "no level in progress", .Info)
+		return
+	}
+
+	if campaign.level_complete(s.world, s.level) {
+		out(s, "this level is done. `levels` to pick another.", .Info)
+		return
+	}
+
+	hint, index, ok := campaign.next_hint(s.world, s.level, s.hints_shown)
+	if !ok {
+		// Either the level is out of hints, or every remaining one relates to
+		// something already achieved. Say which -- "no more hints" while the
+		// player is genuinely stuck would be the worst outcome of the feature.
+		out(s, "no hints left for what is still outstanding.", .Info)
+		out(s, "`objectives` for what remains, `retry` to start over.", .Info)
+		return
+	}
+
+	// Everything up to and including this one is now spent, so a skipped hint
+	// for a step you solved yourself does not come back later.
+	s.hints_shown = index + 1
+
+	remaining := campaign.hints_remaining(s.world, s.level, s.hints_shown)
+
+	// Name the step the hint is about, so it is clear what is being helped with.
+	if hint.unblocks >= 0 && hint.unblocks < len(s.level.objectives) {
+		out(s, fmt.tprintf("hint (%d more): %s", remaining, s.level.objectives[hint.unblocks].text), .Info)
+	} else {
+		out(s, fmt.tprintf("hint (%d more)", remaining), .Info)
+	}
+	for line in hint.lines {
+		out(s, fmt.tprintf("  %s", line), .Heading)
+	}
+}
+
 // --- technique coverage -----------------------------------------------------
 
 cmd_techniques :: proc(s: ^Session, cmd: ^Command) {

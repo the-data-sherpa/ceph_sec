@@ -84,6 +84,28 @@ Objective :: struct {
 	optional: bool, // not required to complete, but rewarded in the debrief
 }
 
+// One step of escalating help.
+//
+// Hints are a single ordered list per level rather than a set attached to each
+// objective, because a level's objectives are steps of one chain and its hints
+// are one narrative: you have not looked yet -> the page mentions a file ->
+// here is the command. Splitting that across four arrays fragments the writing
+// for no gain.
+//
+// `unblocks` is what keeps a flat list from telling you something you solved
+// ten minutes ago: `hint` skips forward to the first hint whose objective is
+// still outstanding. Authoring stays one list; relevance is preserved.
+Hint :: struct {
+	unblocks: int, // index into Level.objectives; -1 for level-wide advice
+
+	// One hint is one complete thought, however many lines it takes to say.
+	// Splitting a sentence across two entries would cost two presses to receive
+	// half an idea each -- the array is a list of hints, not of lines.
+	lines: []string,
+}
+
+HINT_ANY :: -1
+
 // What the level taught, said plainly once it is over. This is the part that
 // makes it a learning game rather than a puzzle game: the player has just done
 // the thing, and now finds out what the thing is called and how it is stopped.
@@ -120,7 +142,15 @@ Level :: struct {
 
 	brief:      []string,
 	objectives: []Objective,
-	debrief:    Debrief,
+
+	// Ordered from a nudge to the answer. The last hint for a step should be
+	// concrete enough to act on -- a hint system that runs out while you are
+	// still stuck is worse than none -- and every non-optional objective needs
+	// at least one, which the validator enforces. The promise is that you can
+	// never be hard-stuck, and it only holds if it is kept everywhere.
+	hints: []Hint,
+
+	debrief: Debrief,
 
 	// Constructs the level's world and returns the host the player starts on.
 	// Called after sim.world_reset, so it may assume an empty world.
@@ -195,6 +225,57 @@ objective_met :: proc(w: ^sim.World, o: Objective) -> bool {
 		return ok && sim.subnet_reachable(w, h)
 	}
 	return false
+}
+
+// The next hint worth giving: the first one not yet shown whose objective is
+// still outstanding. Returns the index into `hints` so the caller can record
+// what has been revealed.
+//
+// Skipping ahead is the whole point. Asking for help and being told to do
+// something you already did teaches nothing and reads as though the game is not
+// paying attention.
+next_hint :: proc(w: ^sim.World, l: ^Level, shown: int) -> (hint: Hint, index: int, ok: bool) {
+	// A finished level has nothing worth advising, including level-wide advice.
+	if level_complete(w, l) {
+		return {}, 0, false
+	}
+	for h, i in l.hints {
+		if i < shown {
+			continue
+		}
+		if h.unblocks == HINT_ANY {
+			return h, i, true
+		}
+		if h.unblocks < 0 || h.unblocks >= len(l.objectives) {
+			continue // malformed; the validator rejects these
+		}
+		if !objective_met(w, l.objectives[h.unblocks]) {
+			return h, i, true
+		}
+	}
+	return {}, 0, false
+}
+
+// How many hints relate to steps still outstanding -- what `hint` can still
+// usefully say, for "[2/5]" style counting.
+hints_remaining :: proc(w: ^sim.World, l: ^Level, shown: int) -> int {
+	if level_complete(w, l) {
+		return 0
+	}
+	n := 0
+	for h, i in l.hints {
+		if i < shown {
+			continue
+		}
+		if h.unblocks == HINT_ANY {
+			n += 1
+			continue
+		}
+		if h.unblocks >= 0 && h.unblocks < len(l.objectives) && !objective_met(w, l.objectives[h.unblocks]) {
+			n += 1
+		}
+	}
+	return n
 }
 
 // A level is complete when every non-optional objective is met.

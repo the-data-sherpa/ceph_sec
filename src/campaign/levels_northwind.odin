@@ -32,6 +32,9 @@ LEVEL_NORTHWIND := Level {
 		"New this level: they are watching. Everything you do costs",
 		"attention in the segment you do it in, and enough of it",
 		"ends the engagement. Run `trace` to see where you stand.",
+		"",
+		"Nothing here is a technique you have not already used.",
+		"`hint` if you want a nudge anyway.",
 	},
 	objectives = {
 		{text = "Map the DMZ", goal = Goal_Discover_Host{"web01"}},
@@ -40,6 +43,22 @@ LEVEL_NORTHWIND := Level {
 		{text = "Reach the internal segment", goal = Goal_Reach_Subnet{"CORP"}},
 		{text = "Recover the manifest", goal = Goal_Read_File{"fs01", "/srv/backup/manifest.sql"}},
 		{text = "Finish without tripping an alarm", goal = Goal_Reach_Subnet{"CORP"}, optional = true},
+	},
+	// The hint that matters most is the fourth step. Taking the jump box and
+	// then having nowhere to go is exactly where this level stranded its first
+	// player -- the clues are on jump01 now, but a hint should still point at
+	// the habit rather than the file.
+	hints = {
+		{0, {"Start where you always start: what is on 10.0.4.0/24, and", "what is it running."}},
+		{1, {"One of them serves web pages. You have read a page's", "source for a leaked path twice already."}},
+		{1, {"curl http://10.0.4.11/ -- then fetch what it mentions."}},
+		{2, {"The credential is reused, and the .env even names the", "host it was meant for."}},
+		{2, {"ssh svc@10.0.4.19 -- that account is an admin there,", "which is what opens the route onward."}},
+		{3, {"You are on a machine sitting in two networks. It was put", "there precisely to reach the one you cannot."}},
+		{3, {"The first thing worth reading on a host you have taken", "is what it talks to: history, hosts file, interfaces."}},
+		{3, {"cat /home/svc/.bash_history names the internal host."}},
+		{4, {"The internal segment is 10.0.9.0/24. Scan it, then use", "the same credential again: ssh svc@10.0.9.10"}},
+		{4, {"The manifest is at /srv/backup/manifest.sql -- cat it."}},
 	},
 	debrief = Debrief {
 		what = {

@@ -47,7 +47,8 @@ and honours `ODIN=` if it lives elsewhere.
 ```
 
 While running: `levels` lists the campaign, `play <n>` starts one, `objectives`
-shows your goals, `retry` restarts, and `techniques` shows your ATT&CK coverage.
+shows your goals, `hint` gives an escalating nudge, `retry` restarts, and
+`techniques` shows your ATT&CK coverage.
 `help` lists what you can run — including what you *cannot* yet, and which level
 teaches it.
 
@@ -137,6 +138,12 @@ grant a new command; the rest teach a technique using what you already hold.
 | 3 | Left in the open | T1552.001 Credentials In Files | `curl` |
 | 4 | The same password, twice | T1078.003 Valid Accounts | `ssh` |
 | 5 | Northwind Logistics | *combine* — and the detection system arrives | — |
+
+Briefs state the goal and which tool applies, never the exact invocation — the
+command lives behind `hint`, which escalates from a nudge to the answer and
+skips past steps you have already solved. Using hints is recorded and never
+penalised; finishing without them is noted in the debrief. That opt-in *is* the
+difficulty setting.
 
 **Levels are compiled-in Odin data**, so a level referencing a missing
 prerequisite or an uncatalogued technique fails to build. A validator test

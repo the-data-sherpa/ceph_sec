@@ -402,6 +402,122 @@ test_every_step_targets_something_the_player_could_know :: proc(t: ^testing.T) {
 	}
 }
 
+// --- hints ------------------------------------------------------------------
+
+// The promise: while a level is unfinished, asking for a hint gets you
+// something about what is still outstanding.
+//
+// Checked dynamically rather than as "every objective has a hint", because
+// several objectives are often satisfied by one action -- level one's three
+// finds all fall out of a single sweep. What matters is not the shape of the
+// data but whether a stuck player is ever left with nothing to ask for.
+@(test)
+test_a_hint_is_always_available_while_a_level_is_unfinished :: proc(t: ^testing.T) {
+	for &level in campaign.LEVELS {
+		wt, has := walkthrough_for(level.id)
+		if !has {
+			continue
+		}
+
+		p: Play
+		play_open(&p, &level)
+		defer play_close(&p)
+
+		// Before anything, and after each step short of completion.
+		for step, i in wt.steps {
+			if campaign.level_complete(&p.w, &level) {
+				break
+			}
+			_, _, ok := campaign.next_hint(&p.w, &level, 0)
+			testing.expectf(
+				t,
+				ok,
+				"level %d (%s): nothing to hint at after %d step(s) -- a player stuck here has no help",
+				level.number,
+				level.id,
+				i,
+			)
+			play_do(&p, step)
+		}
+
+		// And once finished, there is nothing left to hint at.
+		testing.expectf(t, campaign.level_complete(&p.w, &level), "level %q did not finish", level.id)
+		testing.expect_value(t, campaign.hints_remaining(&p.w, &level, 0), 0)
+	}
+}
+
+// Escalation: asking repeatedly walks forward rather than repeating, and the
+// last hint for a step is concrete enough to act on.
+@(test)
+test_hints_escalate_and_do_not_repeat :: proc(t: ^testing.T) {
+	level, _ := campaign.level_by_id("recon-sweep")
+
+	p: Play
+	play_open(&p, level)
+	defer play_close(&p)
+
+	seen := make([dynamic]string, 0, 8, context.temp_allocator)
+	for _ in 0 ..< 12 {
+		before := p.sess.hints_shown
+		play_do(&p, "hint")
+		if p.sess.hints_shown == before {
+			break // exhausted
+		}
+		text := play_transcript(&p)
+		for previous in seen {
+			testing.expectf(t, !strings.contains(text, previous), "hint repeated: %q", previous)
+		}
+		append(&seen, strings.clone(text, context.temp_allocator))
+	}
+
+	testing.expect(t, len(seen) >= 3, "there should be several escalating hints")
+	// The last one has to be actionable -- running out while still stuck is
+	// worse than having no hints at all.
+	last := seen[len(seen) - 1]
+	testing.expect(t, strings.contains(last, "nmap"), "the final hint should name the command")
+}
+
+// A hint about something already done is a hint that teaches nothing and reads
+// as though the game is not paying attention. This is the whole reason hints
+// carry the step they unblock.
+@(test)
+test_hints_skip_steps_already_solved :: proc(t: ^testing.T) {
+	level, _ := campaign.level_by_id("access-exposure")
+
+	p: Play
+	play_open(&p, level)
+	defer play_close(&p)
+
+	// Do the first two steps unaided.
+	play_do(&p, "nmap -sV 10.0.5.0/24")
+	play_do(&p, "curl http://10.0.5.12/")
+	play_transcript(&p)
+	testing.expect(t, campaign.objective_met(&p.w, level.objectives[0]))
+	testing.expect(t, campaign.objective_met(&p.w, level.objectives[1]))
+
+	play_do(&p, "hint")
+	text := play_transcript(&p)
+
+	// It should be helping with the credential, not with scanning.
+	testing.expect(t, strings.contains(text, "Obtain a credential"), "the hint should name the outstanding step")
+	testing.expect(t, !strings.contains(text, "find out what is there"), "and not re-explain a solved one")
+}
+
+@(test)
+test_hint_says_so_when_the_level_is_done :: proc(t: ^testing.T) {
+	level, _ := campaign.level_by_id("recon-sweep")
+
+	p: Play
+	play_open(&p, level)
+	defer play_close(&p)
+
+	play_do(&p, "nmap -sn 10.0.4.0/24")
+	play_transcript(&p)
+
+	play_do(&p, "hint")
+	testing.expect(t, strings.contains(play_transcript(&p), "done"))
+}
+
 // --- gating -----------------------------------------------------------------
 
 @(test)

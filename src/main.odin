@@ -148,7 +148,7 @@ main :: proc() {
 		// summary rather than after it.
 		if debrief_pending {
 			debrief_pending = false
-			level_debrief(&w, sess.level, &progress, &term)
+			level_debrief(&w, sess.level, &progress, &term, sess.hints_shown)
 			ui.term_scroll_to_bottom(&term)
 		}
 
@@ -770,13 +770,26 @@ brief :: proc(w: ^sim.World, level: ^campaign.Level) {
 // Said once, when the last required objective falls. The teaching payload: the
 // player has just done the thing, and now finds out what it is called and how
 // it is stopped.
-level_debrief :: proc(w: ^sim.World, level: ^campaign.Level, progress: ^campaign.Progress, term: ^ui.Term) {
+level_debrief :: proc(
+	w: ^sim.World,
+	level: ^campaign.Level,
+	progress: ^campaign.Progress,
+	term: ^ui.Term,
+	hints_used: int,
+) {
 	push :: proc(w: ^sim.World, term: ^ui.Term, text: string, colour: ui.Color_Id) {
 		ui.term_push(term, fmt.aprintf("%s", text, allocator = w.allocator), colour)
 	}
 
 	push(w, term, "", .Text)
 	push(w, term, fmt.aprintf("== LEVEL %d COMPLETE ==", level.number, allocator = w.allocator), .Good)
+
+	// Noted, never charged. A quiet acknowledgement for working it out unaided,
+	// and nothing at all for having asked -- penalising someone for learning
+	// would be backwards in a game whose entire point is to teach.
+	if hints_used == 0 {
+		push(w, term, "finished without hints", .Good)
+	}
 
 	optional_done, optional_total := 0, 0
 	for o in level.objectives {
