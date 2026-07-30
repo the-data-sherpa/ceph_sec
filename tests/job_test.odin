@@ -1,5 +1,6 @@
 package tests
 
+import "core:fmt"
 import "core:strings"
 import "core:testing"
 import "../src/shell"
@@ -426,6 +427,191 @@ test_no_tool_leaves_orphaned_timers :: proc(t: ^testing.T) {
 		testing.expectf(t, len(f.w.timers) == 0, "%q left %d orphaned timers", line, len(f.w.timers))
 		testing.expectf(t, !shell.session_active(&f.sess), "%q left a job running", line)
 	}
+}
+
+// --- job control commands ---------------------------------------------------
+
+// `fg` shipped in M2 without a single test executing it. Promoting a job must
+// hand it the terminal *and* give its slot back -- it is no longer running in
+// the background, so it should stop being counted as if it were.
+@(test)
+test_fg_promotes_a_background_job :: proc(t: ^testing.T) {
+	f: Fixture
+	fixture(&f)
+	defer fixture_destroy(&f)
+
+	shell.session_exec(&f.sess, "nmap -sV 10.0.4.0/24 &")
+	id := f.sess.next_job_id
+	testing.expect(t, !shell.session_busy(&f.sess))
+	testing.expect_value(t, shell.slots_in_use(&f.sess), 1)
+	transcript(&f)
+
+	step(&f, 20)
+	shell.session_exec(&f.sess, "fg")
+
+	testing.expect(t, shell.session_busy(&f.sess), "fg should hand the job the terminal")
+	testing.expect_value(t, f.sess.fg, id)
+	testing.expect_value(t, shell.slots_in_use(&f.sess), 0)
+	testing.expect(t, strings.contains(transcript(&f), "nmap -sV"), "fg should echo what it promoted")
+
+	// And it is now interruptible with ^C, like any foreground command.
+	shell.session_interrupt(&f.sess)
+	testing.expect(t, !shell.session_busy(&f.sess))
+	testing.expect_value(t, len(f.w.timers), 0)
+}
+
+@(test)
+test_fg_refuses_while_the_terminal_is_held :: proc(t: ^testing.T) {
+	f: Fixture
+	fixture(&f)
+	defer fixture_destroy(&f)
+
+	shell.session_exec(&f.sess, "nmap -sV 10.0.4.0/24 &")
+	background := f.sess.next_job_id
+	shell.session_exec(&f.sess, "curl http://10.0.4.11/") // foreground
+	held := f.sess.fg
+	transcript(&f)
+
+	shell.session_exec(&f.sess, fmt_id(&f, "fg %%%d", background))
+
+	testing.expect(t, strings.contains(transcript(&f), "already holds the terminal"))
+	testing.expect_value(t, f.sess.fg, held) // unchanged
+	testing.expect_value(t, shell.slots_in_use(&f.sess), 1)
+}
+
+// Bare `fg` and bare `kill` take the most recently launched job, which is what
+// makes the common case one word.
+@(test)
+test_bare_fg_and_kill_take_the_newest_job :: proc(t: ^testing.T) {
+	f: Fixture
+	fixture(&f)
+	defer fixture_destroy(&f)
+
+	shell.session_exec(&f.sess, "nmap -sV 10.0.4.0/24 &")
+	older := f.sess.next_job_id
+	shell.session_exec(&f.sess, "curl http://10.0.4.11/.env &")
+	newer := f.sess.next_job_id
+	transcript(&f)
+
+	shell.session_exec(&f.sess, "kill")
+	transcript(&f)
+
+	_, newer_alive := shell.job_by_id(&f.sess, newer)
+	older_job, older_alive := shell.job_by_id(&f.sess, older)
+	testing.expect(t, !newer_alive, "bare kill should have taken the newest")
+	testing.expect(t, older_alive, "and left the older one running")
+	testing.expect_value(t, older_job.id, older)
+}
+
+@(test)
+test_job_commands_reject_unknown_ids :: proc(t: ^testing.T) {
+	f: Fixture
+	fixture(&f)
+	defer fixture_destroy(&f)
+
+	// Nothing running at all.
+	shell.session_exec(&f.sess, "fg")
+	testing.expect(t, strings.contains(transcript(&f), "no such job"))
+	shell.session_exec(&f.sess, "kill %3")
+	testing.expect(t, strings.contains(transcript(&f), "no such job"))
+
+	// A job that has already finished is gone, not merely idle.
+	shell.session_exec(&f.sess, "curl http://10.0.4.11/ &")
+	done := f.sess.next_job_id
+	settle(&f)
+	transcript(&f)
+
+	shell.session_exec(&f.sess, fmt_id(&f, "kill %%%d", done))
+	testing.expect(t, strings.contains(transcript(&f), "no such job"))
+
+	// Garbage arguments are rejected rather than parsed into job 0.
+	shell.session_exec(&f.sess, "kill %abc")
+	testing.expect(t, strings.contains(transcript(&f), "no such job"))
+}
+
+@(test)
+test_jobs_lists_what_is_running :: proc(t: ^testing.T) {
+	f: Fixture
+	fixture(&f)
+	defer fixture_destroy(&f)
+
+	shell.session_exec(&f.sess, "jobs")
+	testing.expect(t, strings.contains(transcript(&f), "no jobs running"))
+
+	shell.session_exec(&f.sess, "nmap -sV 10.0.4.0/24 &")
+	shell.session_exec(&f.sess, "curl http://10.0.4.11/") // foreground
+	transcript(&f)
+
+	shell.session_exec(&f.sess, "jobs")
+	listing := transcript(&f)
+
+	testing.expect(t, strings.contains(listing, "nmap"), "the background job should be listed")
+	testing.expect(t, strings.contains(listing, "curl"), "so should the foreground one")
+	testing.expect(t, strings.contains(listing, "+"), "the foreground job should be marked")
+	// Slots count background work only, so one of the two is using a slot.
+	testing.expect(t, strings.contains(listing, "1 of 2 slots"), "slot usage should be reported")
+}
+
+// Said once per run, the first time it could matter. Repeating it every kill
+// would be noise; never saying it leaves players assuming a kill undoes the
+// noise the command already charged.
+@(test)
+test_the_kill_hint_is_said_once :: proc(t: ^testing.T) {
+	f: Fixture
+	fixture(&f)
+	defer fixture_destroy(&f)
+
+	shell.session_exec(&f.sess, "nmap -sV 10.0.4.0/24 &")
+	shell.session_exec(&f.sess, "kill")
+	testing.expect(t, strings.contains(transcript(&f), "killing saves time, not attention"))
+
+	shell.session_exec(&f.sess, "curl http://10.0.4.11/ &")
+	shell.session_exec(&f.sess, "kill")
+	testing.expect(t, !strings.contains(transcript(&f), "killing saves time"), "the hint should not repeat")
+}
+
+// Killing genuinely does not refund the charge -- the rule the hint describes.
+@(test)
+test_killing_does_not_refund_noise :: proc(t: ^testing.T) {
+	f: Fixture
+	fixture(&f)
+	defer fixture_destroy(&f)
+
+	shell.session_exec(&f.sess, "nmap -sV 10.0.4.0/24 &")
+	charged := suspicion_of(&f, f.dmz)
+	testing.expect(t, charged > 0, "dispatch should have charged")
+
+	shell.session_exec(&f.sess, "kill")
+	testing.expect_value(t, suspicion_of(&f, f.dmz), charged)
+
+	// Still no refund once the clock passes where the job would have ended.
+	step(&f, 60)
+	testing.expect(t, suspicion_of(&f, f.dmz) <= charged, "suspicion may decay but must never be credited back")
+	testing.expect(t, suspicion_of(&f, f.dmz) > 0)
+}
+
+@(test)
+test_trace_command_reports_real_state :: proc(t: ^testing.T) {
+	f: Fixture
+	fixture(&f)
+	defer fixture_destroy(&f)
+
+	shell.session_exec(&f.sess, "trace")
+	quiet := transcript(&f)
+	testing.expect(t, strings.contains(quiet, "0.0%"), "a clean run should report no trace")
+	testing.expect(t, strings.contains(quiet, "DMZ"), "reachable segments should be listed")
+
+	// Make a segment genuinely hot and check it is reported as such.
+	pin_segment(&f, f.dmz, sim.SUSPICION_ALARM + 1000)
+	sim.tick_n(&f.w, 5)
+	shell.session_exec(&f.sess, "trace")
+	hot := transcript(&f)
+	testing.expect(t, strings.contains(hot, "ALARM"), "a segment over the line should be flagged")
+}
+
+@(private)
+fmt_id :: proc(f: ^Fixture, format: string, id: int) -> string {
+	return fmt.tprintf(format, id)
 }
 
 // --- determinism ------------------------------------------------------------

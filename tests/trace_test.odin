@@ -670,6 +670,28 @@ test_losing_a_host_evicts_the_prompt :: proc(t: ^testing.T) {
 	testing.expect_value(t, f.sess.user, "operator")
 }
 
+// A finished run is terminal in M2, but it must not look like a hung terminal:
+// session_submit has already echoed the command, so the shell owes a reply.
+@(test)
+test_commands_after_the_run_ends_say_so :: proc(t: ^testing.T) {
+	f: Fixture
+	fixture(&f)
+	defer fixture_destroy(&f)
+
+	sim.end_run(&f.w, .Caught)
+	transcript(&f)
+
+	run(&f, "nmap -sV 10.0.4.0/24")
+	reply := transcript(&f)
+	testing.expect(t, strings.contains(reply, "run is over"), "a command after the end needs a reply")
+
+	// And it genuinely did nothing: no job, no noise, no scheduled work.
+	testing.expect(t, !shell.session_active(&f.sess))
+	testing.expect_value(t, len(f.w.timers), 0)
+	testing.expect_value(t, suspicion_of(&f, f.dmz), i32(0))
+	testing.expect_value(t, f.w.run.state, sim.Run_State.Caught)
+}
+
 // --- reset and determinism --------------------------------------------------
 
 // A field added to World and forgotten in world_bind holds a stale arena

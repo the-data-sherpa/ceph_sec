@@ -264,7 +264,12 @@ session_submit :: proc(s: ^Session) {
 // Runs a command line. Exposed separately from submit so tests and `--exec` can
 // drive the shell without synthesising keystrokes.
 session_exec :: proc(s: ^Session, text: string) {
+	// The run is over, and M2 has no restart -- that needs Session teardown that
+	// world_reset cannot currently do safely, and is M4's. Say so rather than
+	// swallowing the command: session_submit has already echoed it, so silence
+	// here looks like the terminal has hung.
 	if sim.run_over(s.world) {
+		out(s, "the run is over. press ESC to quit.", .Info)
 		return
 	}
 
