@@ -434,7 +434,7 @@ Fixture :: struct {
 	w:                     sim.World,
 	sess:                  shell.Session,
 	origin, web, jump, fs: sim.Handle(sim.Host),
-	corp:                  sim.Handle(sim.Subnet),
+	dmz, corp:             sim.Handle(sim.Subnet),
 }
 
 PASSWORD :: "Nw-deploy-2019!"
@@ -443,9 +443,10 @@ PASSWORD :: "Nw-deploy-2019!"
 fixture :: proc(f: ^Fixture) {
 	sim.world_init(&f.w, 0xCEF5EC)
 
-	wan := sim.add_subnet(&f.w, "WAN", sim.addr(198, 51, 100, 0), 24)
-	dmz := sim.add_subnet(&f.w, "DMZ", sim.addr(10, 0, 4, 0), 24)
-	f.corp = sim.add_subnet(&f.w, "CORP", sim.addr(10, 0, 9, 0), 24)
+	wan := sim.add_subnet(&f.w, "WAN", sim.addr(198, 51, 100, 0), 24, .None)
+	dmz := sim.add_subnet(&f.w, "DMZ", sim.addr(10, 0, 4, 0), 24, .Low)
+	f.dmz = dmz
+	f.corp = sim.add_subnet(&f.w, "CORP", sim.addr(10, 0, 9, 0), 24, .Medium)
 
 	f.origin = sim.add_host(&f.w, "ceph", sim.addr(198, 51, 100, 7), wan, "Debian 12")
 	sim.grant_access(&f.w, f.origin, .Root)
@@ -465,13 +466,13 @@ fixture :: proc(f: ^Fixture) {
 	sim.add_file(
 		&f.w,
 		f.web,
-		{path = "/var/www/html/.env", content = "DEPLOY_USER=svc\nDEPLOY_PASS=" + PASSWORD},
+		{path = "/var/www/html/.env", content = "DEPLOY_USER=svc\nDEPLOY_PASS=" + PASSWORD, sensitive = true},
 		{{username = "svc", password = PASSWORD}},
 	)
 	sim.add_file(
 		&f.w,
 		f.web,
-		{path = "/home/svc/deploy.env", content = "DEPLOY_USER=svc\nDEPLOY_PASS=" + PASSWORD},
+		{path = "/home/svc/deploy.env", content = "DEPLOY_USER=svc\nDEPLOY_PASS=" + PASSWORD, sensitive = true},
 		{{username = "svc", password = PASSWORD}},
 	)
 
@@ -481,7 +482,11 @@ fixture :: proc(f: ^Fixture) {
 
 	f.fs = sim.add_host(&f.w, "fs01", sim.addr(10, 0, 9, 10), f.corp, "Windows Server 2016")
 	sim.add_account(&f.w, f.fs, {username = "svc", password = PASSWORD})
-	sim.add_file(&f.w, f.fs, {path = "/srv/backup/manifest.sql", content = "-- objective", sensitive = true})
+	sim.add_file(
+		&f.w,
+		f.fs,
+		{path = "/srv/backup/manifest.sql", content = "-- objective", sensitive = true, objective = true},
+	)
 
 	append(&f.w.links, sim.Link{from = wan, to = dmz, via = f.origin, min_access = .User})
 	append(&f.w.links, sim.Link{from = dmz, to = f.corp, via = f.jump, min_access = .Root})
@@ -507,6 +512,19 @@ run :: proc(f: ^Fixture, line: string, max_ticks := 3000) {
 		shell.session_update(&f.sess)
 	}
 	shell.session_update(&f.sess)
+}
+
+// Advances until nothing is running and nothing is queued, or the budget runs
+// out. Unlike `run` this starts no command -- it lets background work finish.
+@(private)
+settle :: proc(f: ^Fixture, max_ticks := 3000) {
+	for _ in 0 ..< max_ticks {
+		if !shell.session_active(&f.sess) && len(f.w.timers) == 0 {
+			return
+		}
+		sim.tick(&f.w)
+		shell.session_update(&f.sess)
+	}
 }
 
 // Drains the event ring into one string so tests can assert on what the player
@@ -1006,28 +1024,39 @@ test_editing_before_submit :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(transcript(&f), "operator"))
 }
 
-// A busy terminal must swallow keystrokes rather than let a half-typed command
-// accumulate behind a running scan -- except ^C, which must always land.
+// The prompt stays live while a foreground job runs: you can type, and builtins
+// still work. What is refused is *dispatching a second tool*, and the refusal
+// says so rather than silently eating the keystroke.
+//
+// Replaces M1's test_input_is_ignored_while_busy_except_interrupt, whose
+// behaviour backgrounding deliberately removes.
 @(test)
-test_input_is_ignored_while_busy_except_interrupt :: proc(t: ^testing.T) {
+test_prompt_stays_live_while_a_job_runs :: proc(t: ^testing.T) {
 	f: Fixture
 	fixture(&f)
 	defer fixture_destroy(&f)
 
 	shell.session_exec(&f.sess, "nmap -sV 10.0.4.0/24")
 	testing.expect(t, shell.session_busy(&f.sess))
+	transcript(&f)
 
-	type_text(&f.sess, "rm -rf /")
+	// Typing is accepted.
+	type_text(&f.sess, "whoami")
+	testing.expect_value(t, shell.line_text(&f.sess.line, context.temp_allocator), "whoami")
+
+	// And a builtin runs, mid-scan.
 	press(&f.sess, .Enter)
-	testing.expect_value(t, shell.line_text(&f.sess.line, context.temp_allocator), "")
-	testing.expect(t, shell.session_busy(&f.sess), "Enter must not submit while busy")
+	testing.expect(t, strings.contains(transcript(&f), "operator"), "builtins run while a job holds the terminal")
+	testing.expect(t, shell.session_busy(&f.sess), "the scan should still be running")
 
+	// A second *tool* is refused, and the message names the way out.
+	shell.session_exec(&f.sess, "curl http://10.0.4.11/")
+	refusal := transcript(&f)
+	testing.expect(t, strings.contains(refusal, "&"), "the refusal should name backgrounding")
+
+	// ^C always lands.
 	press(&f.sess, .Ctrl_C)
-	testing.expect(t, !shell.session_busy(&f.sess), "^C must land even while busy")
-
-	// And the terminal takes input again immediately afterwards.
-	type_text(&f.sess, "pwd")
-	testing.expect_value(t, shell.line_text(&f.sess.line, context.temp_allocator), "pwd")
+	testing.expect(t, !shell.session_busy(&f.sess), "^C must free the terminal")
 }
 
 @(test)

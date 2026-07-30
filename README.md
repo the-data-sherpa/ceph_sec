@@ -1,7 +1,9 @@
 # Ceph.Sec
 
-A hacking game in [Odin](https://odin-lang.org). Procedurally generated corporate
-networks, real-time trace pressure, and a CRT terminal to work through.
+A cybersecurity **learning game** in [Odin](https://odin-lang.org): a campaign of
+levels structured around [MITRE ATT&CK](https://attack.mitre.org/), played through
+a CRT terminal. Each level teaches one technique, and completing it permanently
+unlocks the tool it taught.
 
 The tools carry their real names — `nmap`, `ssh`, `hydra` — and the workflow is
 the real one: recon, enumerate, exploit, pivot, exfil. Everything they act on is
@@ -10,10 +12,11 @@ can't**: the simulation package is mechanically forbidden from importing any I/O
 platform, or vendor package, and `./build.sh gate` fails the build if that ever
 changes.
 
-> **Status: milestone 1 — the terminal works.** You can type into it. A short
-> run is playable end to end: scan the DMZ, find an exposed `.env`, reuse the
-> password it leaks to take the jump box, pivot into the internal segment and
-> recover the objective. No trace pressure or background jobs yet — those are M2.
+> **Status: milestone 3 — the campaign framework.** Five levels play end to end,
+> from a first host sweep to a full engagement. Tools unlock as you earn them,
+> objectives tick off as you meet them, and each level ends by naming the
+> technique you just used and how a defender stops it. The remaining ~55 levels
+> are content to be authored against a framework that is finished and tested.
 
 ## Setup
 
@@ -43,9 +46,20 @@ and honours `ODIN=` if it lives elsewhere.
 ./build.sh all        # check + test + build
 ```
 
-While running, type `help`. `^C` interrupts a running command, `PgUp`/`PgDn`
-scroll, and `↑`/`↓` walk history. Display: `F1` CRT on/off · `F2` curved/flat ·
-`F3` theme · `F12` screenshot · `ESC` quit.
+While running: `levels` lists the campaign, `play <n>` starts one, `objectives`
+shows your goals, `retry` restarts, and `techniques` shows your ATT&CK coverage.
+`help` lists what you can run — including what you *cannot* yet, and which level
+teaches it.
+
+Suffix a command with `&` to background it, then `jobs` / `fg` / `kill`; `trace`
+shows how much attention you have drawn. `^C` interrupts the foreground command,
+`PgUp`/`PgDn` scroll, `↑`/`↓` walk history. Display: `F1` CRT on/off · `F2`
+curved/flat · `F3` theme · `F12` screenshot · `ESC` quit.
+
+```
+nmap -sV -T2 10.0.4.0/24 &     a slow, quiet scan, running in the background
+curl http://10.0.4.11/.env     ...while you work on something else
+```
 
 ```sh
 ./build/cephsec --shot 12.5 frame.png            # run to a tick, capture, exit
@@ -65,28 +79,30 @@ are not honoured.
 A directory is a package in Odin, and imports may only point downward.
 
 ```
-src/sim/     simulation core — world, scheduler, events. Pure and deterministic.
-src/shell/   parsing, commands, tools. Pure — nmap and ssh live here.
-src/input/   shared key vocabulary. No dependencies at all.
-src/ui/      character grid, terminal, CRT pipeline — the only raylib consumer
-src/main.odin  wires them together, owns the frame loop and the scenario
-tests/       sim + shell suites (odin test)
-assets/      crt.fs and future content
-docs/        design.md — the systems bible
+src/sim/       simulation core — world, scheduler, events, trace. Deterministic.
+src/campaign/  ATT&CK catalogue, level definitions, progress. Pure content.
+src/shell/     parsing, commands, jobs, tools. Pure — nmap and ssh live here.
+src/input/     shared key vocabulary. No dependencies at all.
+src/ui/        character grid, terminal, CRT pipeline — the only raylib consumer
+src/main.odin  wires them together, owns the frame loop and level transitions
+tests/         engine, campaign and playthrough suites (odin test)
+assets/        crt.fs
+docs/          design.md — the systems bible
 ```
 
-`sim ← shell ← main → ui`, with `input` as a shared leaf. Odin rejects import
-cycles, so the direction is compiler-enforced.
+`sim ← campaign ← shell ← main → ui`, with `input` as a shared leaf. Odin
+rejects import cycles, so the direction is compiler-enforced.
 
 ### The three invariants
 
 Established now because they cost nothing at this size and would be a rewrite
 to retrofit once tools and gameplay exist.
 
-1. **The sim and shell perform no I/O.** Enforced by `build.sh gate`, not
-   convention. This matters most for `shell`: it is where the commands named
+1. **The sim, shell and campaign perform no I/O.** Enforced by `build.sh gate`,
+   not convention. This matters most for `shell`: it is where the commands named
    `nmap` and `ssh` live, and therefore the one place someone might be tempted
-   to make one of them real. The gate makes that a build failure.
+   to make one of them real. The gate makes that a build failure, and it covers
+   level content too.
 2. **The sim does not render.** It appends to an event ring; the frontend drains
    it. Enforced by Odin's import rules.
 3. **The sim is deterministic.** It advances only via `sim.tick()` at a fixed
@@ -94,10 +110,40 @@ to retrofit once tools and gameplay exist.
    wall-clock delta into whole ticks. Same seed and tick count means a
    byte-identical world, which is what makes seeds shareable and replays real.
 
+   Concurrency does not weaken this. There are no threads — background jobs are
+   timers interleaving on the tick loop, and the purity gate's ban on
+   `core:thread` is what guarantees it stays that way. Anything that gates a
+   decision is a pure function of `w.now` rather than a latched flag, so the
+   tick a command dispatches on cannot depend on the frame rate. All trace
+   arithmetic is integer, with the sub-divisor remainder carried between ticks,
+   so batching cannot change a total.
+
 The PRNG (PCG32) is hand-rolled rather than taken from `core:math/rand` for the
 same reason: `core:math/rand` may change algorithm between Odin releases, which
 would silently invalidate every seed ever shared without breaking a build.
 `tests/sim_test.odin` pins it against the reference PCG32 vector.
+
+## The campaign
+
+Levels follow ATT&CK's tactics in kill-chain order, in blocks of roughly four:
+**teach → teach → apply → combine**. Techniques are not tools — `T1078 Valid
+Accounts` and `T1110 Brute Force` both yield credentials — so only some levels
+grant a new command; the rest teach a technique using what you already hold.
+
+| # | Level | Technique | Unlocks |
+| --- | --- | --- | --- |
+| 1 | Knock and see who answers | T1595.001 Scanning IP Blocks | `nmap` |
+| 2 | What is it running? | T1595.002 Vulnerability Scanning | — |
+| 3 | Left in the open | T1552.001 Credentials In Files | `curl` |
+| 4 | The same password, twice | T1078.003 Valid Accounts | `ssh` |
+| 5 | Northwind Logistics | *combine* — and the detection system arrives | — |
+
+**Levels are compiled-in Odin data**, so a level referencing a missing
+prerequisite or an uncatalogued technique fails to build. A validator test
+proves the prerequisite graph is acyclic, that no level offers a tool the player
+cannot have by then, and that every objective points at something the level
+actually builds. A second suite finishes every level through its own walkthrough
+— the authored-content equivalent of proving a generated network solvable.
 
 ## Roadmap
 
@@ -105,9 +151,13 @@ would silently invalidate every seed ever shared without breaking a build.
 | --- | --- |
 | **M0** | engine foundation — sim core, scheduler, events, CRT pipeline ✅ |
 | **M1** | terminal input, command parser, first tools ✅ |
-| M2 | async jobs and trace pressure — the run becomes losable |
-| M3 | procedural network generation with attack-graph solvability proof |
-| M4 | net map, exfil objectives, run-end |
-| M5 | meta-progression between runs |
+| **M2** | background jobs and trace pressure — the run becomes losable ✅ |
+| **M3** | campaign framework, ATT&CK curriculum, first five levels ✅ |
+| M4 | the remaining tactic blocks, as content |
+| M5 | progress persistence, graded hints, par scoring |
 
-See `docs/design.md` for the systems design these build toward.
+Procedural generation is no longer planned. Authored levels are what a teaching
+game needs, and a generated network cannot carry a lesson. If it returns it will
+be a post-campaign endless mode, reusing the validator to prove solvability.
+
+See `docs/design.md` for the systems design these build on.

@@ -348,6 +348,13 @@ test_scheduled_action_does_not_apply_early :: proc(t: ^testing.T) {
 
 	dmz := sim.add_subnet(&w, "DMZ", sim.addr(10, 0, 4, 0), 24)
 	corp := sim.add_subnet(&w, "CORP", sim.addr(10, 0, 9, 0), 24)
+
+	// A foothold in the DMZ, so the segment is reachable. Discovery requires
+	// reachability -- results can only land for a host you can actually touch --
+	// so without this nothing in the DMZ would ever be discoverable.
+	foot := sim.add_host(&w, "foothold", sim.addr(10, 0, 4, 2), dmz)
+	sim.grant_access(&w, foot, .Root)
+
 	jump := sim.add_host(&w, "jump01", sim.addr(10, 0, 4, 19), dmz)
 	sim.add_service(&w, jump, sim.Service{port = 22, name = "ssh"})
 	append(&w.links, sim.Link{from = dmz, to = corp, via = jump, min_access = .Root})
@@ -363,7 +370,7 @@ test_scheduled_action_does_not_apply_early :: proc(t: ^testing.T) {
 	testing.expect(t, !host.services[0].discovered, "service discovered before its tick")
 	testing.expect_value(t, host.access, sim.Access.None)
 	testing.expect(t, !sim.subnet_reachable(&w, corp), "CORP reachable before the pivot fired")
-	testing.expect_value(t, sim.ring_pending(&w.events), 0)
+	testing.expect_value(t, sim.ring_pending(&w.events), 1) // the foothold grant
 
 	sim.tick_n(&w, 120) // t = 3s: discovery lands, access has not
 	testing.expect(t, host.discovered, "host should be discovered at its tick")
@@ -376,8 +383,109 @@ test_scheduled_action_does_not_apply_early :: proc(t: ^testing.T) {
 	testing.expect(t, sim.subnet_reachable(&w, corp), "CORP should open once jump01 is root")
 
 	// Three actions, three events, and every one of them backed by a real
-	// change to the world.
-	testing.expect_value(t, sim.ring_pending(&w.events), 3)
+	// change to the world -- plus the foothold grant from setup.
+	testing.expect_value(t, sim.ring_pending(&w.events), 4)
+}
+
+// --- tick re-entrancy -------------------------------------------------------
+
+// tick lifts every due timer out before applying any of them, so an action is
+// free to mutate the timer list mid-batch. Applying in place while scanning
+// positionally -- which is what this did through M1 -- would step over timers
+// due in the same tick once a removal shifted the list under the cursor.
+//
+// end_run is the action that makes this observable: it clears w.timers.
+@(test)
+test_action_clearing_timers_does_not_disturb_the_batch :: proc(t: ^testing.T) {
+	w: sim.World
+	sim.world_init(&w, 1)
+	defer sim.world_destroy(&w)
+
+	// All due on the same tick. The middle one ends the run, which clears the
+	// pending list; the batch it belongs to must still be delivered in order,
+	// minus whatever end_run explicitly cancels.
+	sim.log_at(&w, sim.seconds(1), "before")
+	sim.schedule(&w, sim.seconds(1), sim.Act_End_Run{state = .Quit})
+	sim.log_at(&w, sim.seconds(1), "after")
+
+	// Plus a later timer, which end_run must drop.
+	sim.log_at(&w, sim.seconds(5), "never")
+
+	sim.tick_n(&w, 60)
+
+	testing.expect_value(t, w.run.state, sim.Run_State.Quit)
+	testing.expect_value(t, len(w.timers), 0)
+
+	// "before" fired; "after" was lifted in the same batch but stamped
+	// cancelled by end_run; "never" was still pending and was dropped.
+	saw_before, saw_after, saw_never, saw_ended := false, false, false, false
+	for {
+		e, ok := sim.ring_pop(&w.events)
+		if !ok {
+			break
+		}
+		#partial switch ev in e {
+		case sim.Ev_Log:
+			switch ev.text {
+			case "before":
+				saw_before = true
+			case "after":
+				saw_after = true
+			case "never":
+				saw_never = true
+			}
+		case sim.Ev_Run_Ended:
+			saw_ended = true
+		}
+	}
+	testing.expect(t, saw_before, "timer before the end should have fired")
+	testing.expect(t, saw_ended, "run end should be announced")
+	testing.expect(t, !saw_after, "same-tick timer after end_run should be cancelled")
+	testing.expect(t, !saw_never, "later timer should have been dropped")
+}
+
+@(test)
+test_end_run_is_idempotent :: proc(t: ^testing.T) {
+	w: sim.World
+	sim.world_init(&w, 1)
+	defer sim.world_destroy(&w)
+
+	sim.end_run(&w, .Extracted)
+	first := w.run.ended_at
+	sim.tick_n(&w, 60)
+	sim.end_run(&w, .Caught) // must not overwrite how the run ended
+
+	testing.expect_value(t, w.run.state, sim.Run_State.Extracted)
+	testing.expect_value(t, w.run.ended_at, first)
+	testing.expect(t, sim.run_over(&w))
+
+	// Exactly one Ev_Run_Ended.
+	ends := 0
+	for {
+		e, ok := sim.ring_pop(&w.events)
+		if !ok {
+			break
+		}
+		if _, is_end := e.(sim.Ev_Run_Ended); is_end {
+			ends += 1
+		}
+	}
+	testing.expect_value(t, ends, 1)
+}
+
+@(test)
+test_run_state_resets :: proc(t: ^testing.T) {
+	w: sim.World
+	sim.world_init(&w, 1)
+	defer sim.world_destroy(&w)
+
+	sim.end_run(&w, .Caught)
+	sim.world_reset(&w, 2)
+
+	testing.expect_value(t, w.run.state, sim.Run_State.Running)
+	testing.expect_value(t, w.run.ended_at, sim.Tick(0))
+	testing.expect(t, !sim.run_over(&w))
+	testing.expect_value(t, len(w.due), 0)
 }
 
 @(test)
@@ -387,6 +495,10 @@ test_discovery_is_idempotent :: proc(t: ^testing.T) {
 	defer sim.world_destroy(&w)
 
 	sn := sim.add_subnet(&w, "DMZ", sim.addr(10, 0, 4, 0), 24)
+	// Discovery requires the segment to be reachable, so hold something in it.
+	foot := sim.add_host(&w, "foothold", sim.addr(10, 0, 4, 2), sn)
+	sim.grant_access(&w, foot, .Root)
+
 	h := sim.add_host(&w, "gw-edge", sim.addr(10, 0, 4, 1), sn, "Linux")
 	sim.add_service(&w, h, sim.Service{port = 22, name = "ssh", product = "OpenSSH", version = "7.4"})
 
@@ -396,7 +508,8 @@ test_discovery_is_idempotent :: proc(t: ^testing.T) {
 	sim.discover_service(&w, h, 0)
 	sim.discover_service(&w, h, 99) // out of range, must be ignored
 
-	testing.expect_value(t, sim.ring_pending(&w.events), 2)
+	// Two discoveries, plus the Ev_Access_Gained from establishing the foothold.
+	testing.expect_value(t, sim.ring_pending(&w.events), 3)
 }
 
 @(test)

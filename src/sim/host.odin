@@ -98,6 +98,9 @@ File :: struct {
 	sensitive: bool, // counts toward exfil objectives
 	found:     bool,
 
+	// Taking this file is the contract. Set on exactly one file per run.
+	objective: bool,
+
 	// Credentials this file discloses when read. Config files, deployment
 	// scripts and .env files leaking passwords is the most common real-world
 	// path to lateral movement, and it is how creds enter play here.
@@ -113,6 +116,7 @@ Host :: struct {
 	accounts:   [dynamic]Account,
 	files:      [dynamic]File,
 	access:     Access,
+	access_at:  Tick, // when access was last raised; the hunt takes newest first
 	discovered: bool, // player knows it exists
 }
 

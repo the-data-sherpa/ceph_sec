@@ -3,8 +3,13 @@
 The reference the remaining milestones build toward. Entries marked ✅ are
 implemented; everything else is intent, not implementation.
 
-Noise values are documented targets — the trace system that consumes them
-arrives in M2, so nothing charges for noise yet.
+**Ceph.Sec is a learning game.** It is structured as a campaign of ~60 levels
+following MITRE ATT&CK, each teaching a technique and unlocking what it taught.
+Sections 1-7 describe the systems; section 11 describes the curriculum those
+systems exist to carry.
+
+Noise values marked ✅ are the tuned figures actually in use; the rest are
+targets for tools that do not exist yet.
 
 ---
 
@@ -24,8 +29,12 @@ game is that choice, repeated under a clock.
 just hit the weakest host and win. Reaching what you want means getting from the
 segment you landed in to the segment that holds it.
 
-**Runs are short and lossy.** 15–40 minutes. You lose runs. What persists is
-your toolkit and what you learned.
+**Every level teaches something nameable.** Not "you finished it" but "you
+performed T1078.003, this is why it works, this is how it is stopped". The
+debrief is the payload; the level is how the payload is earned.
+
+**Levels are short and repeatable.** Failing and immediately retrying is the
+learning loop, which is why `retry` matters more here than a save file does.
 
 ---
 
@@ -42,7 +51,7 @@ side of the work continuing.
 
 ---
 
-## 3. Run structure
+## 3. Level structure
 
 ```
 brief → insertion → recon → enumerate → exploit → pivot ─┐
@@ -55,9 +64,11 @@ You start with a foothold: a rented VPS, a phished workstation, a misconfigured
 edge device. The brief names an objective — a file, a database, a credential
 set, or persistence itself.
 
-A run ends when you extract (win), the trace completes (caught), or you burn
-your access and can no longer reach the objective (stranded — a real and
-distinct failure, and the one worth designing carefully).
+A level ends when its objectives are met (and the debrief explains what you just
+did), or the trace completes (caught). "Stranded" — no path to the objective
+remains — is deliberately not detected: deciding that correctly needs an
+attack-graph prover, and a heuristic would lie at the worst possible moment.
+Levels are instead built so it cannot arise.
 
 ---
 
@@ -107,9 +118,11 @@ and the segment you need is the one that notices you.
 
 ---
 
-## 5. Trace and detection
+## 5. Trace and detection ✅
 
-Two coupled numbers.
+Two coupled numbers. Implemented in `src/sim/trace.odin`; every quantity is an
+integer in hundredths, because a float here would put the determinism guarantee
+at the mercy of the optimiser.
 
 **Suspicion** is per-segment and rises with the noise of actions taken inside
 it, scaled by that segment's monitoring. It decays while you're quiet. Failed
@@ -124,10 +137,30 @@ Escalating defender responses, so pressure is felt before it's fatal:
 
 | Trace | Response |
 | --- | --- |
-| 25% | log review — recent noisy actions get re-examined; some hosts harden |
-| 50% | alert — credentials rotate, sessions start dropping |
-| 75% | active hunt — a defender walks the network, killing footholds |
+| 25% | log review — every segment you have been noisy in raises its monitoring one step, so everything you do from here costs more |
+| 50% | alert — you are kicked off the box you hold in the hottest segment, and *that host's* passwords rotate |
+| 75% | active hunt — a defender takes one foothold every 20s, newest first, and never your own box |
 | 100% | attribution — run over |
+
+**The 50% response is deliberately narrow.** Rotating "the credential you are
+relying on" would, in a scenario where one reused password *is* the attack path,
+make the objective permanently unreachable — silently, with no `Stranded`
+outcome to detect it. Rewriting passwords on a box you already hold cannot brick
+anything: the credential still opens everything you have not reached, and you
+route around the loss.
+
+**Tuned figures.** Alarm line 60.00; suspicion decays 1.20/s after 5s of quiet;
+excess above the line converts to trace at `excess / 2048` per tick. A segment
+held at 80.00 burns a run in under three minutes; one at 62.00 takes nearly half
+an hour. A *burst* of noise is survivable — decay pulls you back under within
+seconds — but the trace it bought never comes back, so bursts accumulate.
+
+**Being caught is always attributable, mechanically.** The trace cannot rise
+while every segment is below the alarm line, so a lost run always traces back to
+a named segment that sat visibly over a visible line for a recorded number of
+seconds. The end-of-run debrief prints exactly that, along with the loudest
+charges and the command lines responsible. There is a test asserting that ten
+simulated minutes of sub-threshold noise leaves the trace at exactly zero.
 
 **Corollary that makes offline work valuable:** cracking hashes, reading
 captured traffic and `searchsploit` are *free*, because they don't touch the
@@ -147,7 +180,7 @@ values to tune, not commitments.
 | --- | --- | --- | --- |
 | `nmap -sn` ✅ | host discovery, no ports | 6s | 8 |
 | `nmap -sV` ✅ | versions — the good stuff | 14s | 22 |
-| `nmap -sS -T2` | same, slow and quiet | 50s | 6 |
+| `nmap -sV -T2` ✅ | same, ~3.5x slower for a third of the noise | ~18s | 7 |
 | `tcpdump` | passive; yields creds/hosts over time | passive | 0 |
 | `arp -a` | neighbours, from a held host | 1s | 1 |
 
@@ -157,7 +190,7 @@ values to tune, not commitments.
 
 | Tool | Effect | Time | Noise |
 | --- | --- | --- | --- |
-| `curl` ✅ | fetch a page or file from a web root | 1.1s | 10 |
+| `curl` ✅ | fetch a page or file from a web root | 1.1s | 10 / 20 failed |
 | `gobuster` | web paths | 20s | 25 |
 | `enum4linux` | SMB shares, users | 12s | 18 |
 | `searchsploit` | vulns for seen versions — **offline** | 1s | 0 |
@@ -182,6 +215,7 @@ point is *discoverable* rather than guessable.
 
 | Tool | Effect | Time | Noise | Requires |
 | --- | --- | --- | --- | --- |
+| `cat` (sensitive) ✅ | file auditing on material that matters | 0s | 6 | user |
 | `mimikatz` | dump credentials from memory | 5s | 40 | SYSTEM |
 | `hashcat` | crack dumped hashes — **offline** | 60s+ | 0 | — |
 | `linpeas` | local privesc paths | 10s | 8 | user |
@@ -194,7 +228,7 @@ number, and it can make things worse.
 
 ---
 
-## 7. Jobs
+## 7. Jobs ✅
 
 Anything slow is a **Job**: it occupies a slot, reports progress, streams output
 into the terminal as it goes, and can be backgrounded or killed. The prompt
@@ -204,6 +238,19 @@ upgrade.
 This is where real-time earns its place — deciding what to run *while* the
 hydra job grinds is the moment-to-moment game. Jobs are scheduled in ticks
 against the sim clock, so none of it costs determinism.
+
+Implemented in `src/shell/job.odin`. A job's identity is the timer tag the
+scheduler has grouped output under since M0, so `kill %1` and `^C` are a single
+`cancel_tag` call. Its *liveness* is a pure function of `w.now` rather than a
+latched flag — a latch would make "is the prompt free at tick T" depend on where
+the frame boundaries fell, which would silently break reproducibility. A test
+drives an identical session one tick at a time and seven ticks at a time and
+requires byte-identical output.
+
+**Noise is charged at dispatch, in full, and never refunded.** The packets left
+when you pressed Enter. It also removes "start everything loud, watch the meter,
+kill what looks bad" as a strategy: cancelling buys back time and a slot, not
+attention. `kill` says so the first time you use it.
 
 ---
 
@@ -227,17 +274,21 @@ solvable only by brute-forcing everything is a run the trace wins by design.
 
 ---
 
-## 9. Meta-progression
+## 9. Progression ✅
 
-Runs are short and lossy, so something has to carry across them.
+Progression is the curriculum, not a meta-game.
 
-- **Tools** — the roster above unlocks over time; early runs are deliberately
-  under-equipped
-- **Hardware** — more job slots, faster cracking, bigger wordlists
-- **Intel** — recurring clients mean partial maps of networks you've hit before
-- **Reputation** — gates which briefs you're offered
+- **Tools** unlock by completing the level that teaches them. `ssh` is
+  unavailable until level 4, and `help` says so rather than hiding it — seeing
+  what is coming is part of the teaching.
+- **Levels** unlock through a prerequisite graph, validated acyclic at build.
+- **Coverage** is tracked per ATT&CK technique, shown by `techniques`.
 
-Explicitly *not* carried: access. Every run starts cold.
+A level declares its *available* tools separately from what it *grants*, so a
+later level can withhold something you own — "you have `ssh`, but 22 is filtered
+here" — which is how difficulty grows without inventing new mechanics.
+
+Not carried: access, credentials, world state. Every level starts cold.
 
 ---
 
@@ -263,3 +314,46 @@ configured not to, incapable.
 What a player takes away is the *shape* of security work: why versions matter,
 why password reuse is catastrophic, why segmentation is worth the pain, why
 being loud loses. That's knowledge that helps defenders.
+
+---
+
+## 11. The curriculum ✅
+
+Levels follow ATT&CK's tactics in kill-chain order, in blocks of roughly four:
+
+    teach  →  teach  →  apply  →  combine
+
+The **combine** levels are what stop the campaign reading as a syllabus. They
+demand techniques from earlier blocks with nothing saying which, and they are
+where the game stops testing recall and starts testing judgement.
+
+**Techniques are not tools.** T1078 *Valid Accounts* and T1110 *Brute Force*
+both yield credentials and both may use `ssh`. Across ~60 levels only 15–20
+grant a new command; the rest teach a technique, an application, or a
+combination using what the player already holds. A design that granted one tool
+per level would need sixty tools and teach almost nothing.
+
+### What keeps 60 levels honest
+
+Authored content rots the same way generated content does — it just rots when
+someone edits it rather than when the RNG rolls badly. Two test suites stand in
+for the attack-graph prover that procedural generation would have needed:
+
+- **The validator** (`tests/campaign_test.odin`) proves the prerequisite graph
+  is acyclic, that no level offers a tool its prerequisites cannot have granted,
+  that every granted tool is a real command granted exactly once, and — by
+  building each level — that every objective points at something that exists.
+- **The playthroughs** (`tests/playthrough_test.odin`) finish every level using
+  only that level's own tools. A level that stops being winnable fails there,
+  rather than in front of someone who cannot tell whether it is them or the game.
+
+Each level's walkthrough doubles as its reference solution, so a design change
+shows up as a failing test with the objective named.
+
+### The honest limits
+
+ATT&CK is a taxonomy of observed adversary behaviour, not a syllabus. Much of
+Resource Development concerns infrastructure this game does not model, and much
+of Impact is destructive in ways it will not teach. The campaign covers a subset
+deliberately, and `techniques` reports coverage against the catalogue it
+actually implements rather than against the whole matrix.

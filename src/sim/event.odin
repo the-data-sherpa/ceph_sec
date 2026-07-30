@@ -19,6 +19,7 @@ Log_Level :: enum u8 {
 	Plain,   // ordinary tool output
 	Info,    // system notice, background detail
 	Cmd,     // a command the operator issued, echoed back
+	Trace,   // the defender noticing you, or acting on it
 	Heading, // a finding worth the eye stopping on: a host, a section title
 	Data,    // structured detail under a heading: ports, versions, fields
 	Good,    // something worked
@@ -29,6 +30,17 @@ Log_Level :: enum u8 {
 Ev_Log :: struct {
 	text:  string,
 	level: Log_Level,
+
+	// Which background job produced this line; 0 for foreground and for the
+	// world's own output. Sim never interprets it -- it carries the value the
+	// way Timer.tag already does -- but the frontend needs it to put a `[2] `
+	// gutter in front of interleaved output.
+	//
+	// Stamped when the line is scheduled, not resolved when it is drained: a
+	// job's last lines and its own completion notice are drained *after* the
+	// job has been retired, so a drain-time lookup would lose the gutter on
+	// exactly the lines that most need it.
+	job: u16,
 }
 
 Ev_Host_Discovered :: struct {
@@ -49,12 +61,43 @@ Ev_Cred_Obtained :: struct {
 	index: int, // into World.keyring
 }
 
+Ev_Noise :: struct {
+	subnet:  Handle(Subnet),
+	units:   i32, // as charged by the tool
+	applied: i32, // after monitoring scaling
+	total:   i32, // the segment's suspicion afterwards
+}
+
+Ev_Trace_Alarm :: struct {
+	subnet: Handle(Subnet),
+	on:     bool,
+}
+
+Ev_Trace_Stage :: struct {
+	stage: Trace_Stage,
+}
+
+Ev_Access_Lost :: struct {
+	host: Handle(Host),
+	was:  Access,
+}
+
+Ev_Run_Ended :: struct {
+	state: Run_State,
+	at:    Tick,
+}
+
 Event :: union {
 	Ev_Log,
 	Ev_Host_Discovered,
 	Ev_Service_Discovered,
 	Ev_Access_Gained,
 	Ev_Cred_Obtained,
+	Ev_Noise,
+	Ev_Trace_Alarm,
+	Ev_Trace_Stage,
+	Ev_Access_Lost,
+	Ev_Run_Ended,
 }
 
 EVENT_RING_CAP :: 1024

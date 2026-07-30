@@ -18,11 +18,14 @@ Action :: union {
 	Act_Discover_Service,
 	Act_Grant_Access,
 	Act_Harvest_File,
+	Act_End_Run,
+	Act_Hunt_Step,
 }
 
 Act_Log :: struct {
 	text:  string,
 	level: Log_Level,
+	job:   u16, // see Ev_Log.job
 }
 
 Act_Discover_Host :: struct {
@@ -44,6 +47,12 @@ Act_Harvest_File :: struct {
 	index: int,
 }
 
+Act_End_Run :: struct {
+	state: Run_State,
+}
+
+Act_Hunt_Step :: struct {}
+
 // This is the seed of the job system: "nmap finishes in 8 seconds" is a timer,
 // and so is "the trace advances a notch". Scheduling against tick counts rather
 // than wall-clock is what keeps a real-time game deterministic.
@@ -60,7 +69,7 @@ Timer :: struct {
 apply :: proc(w: ^World, a: Action) {
 	switch act in a {
 	case Act_Log:
-		ring_push(&w.events, Ev_Log{text = act.text, level = act.level})
+		ring_push(&w.events, Ev_Log{text = act.text, level = act.level, job = act.job})
 	case Act_Discover_Host:
 		discover_host(w, act.host)
 	case Act_Discover_Service:
@@ -69,6 +78,10 @@ apply :: proc(w: ^World, a: Action) {
 		grant_access(w, act.host, act.level)
 	case Act_Harvest_File:
 		harvest_file(w, act.host, act.index)
+	case Act_End_Run:
+		end_run(w, act.state)
+	case Act_Hunt_Step:
+		hunt_step(w)
 	}
 }
 
@@ -90,7 +103,11 @@ World :: struct {
 	subnets: Pool(Subnet),
 	links:   [dynamic]Link,
 
-	timers:      [dynamic]Timer,
+	timers: [dynamic]Timer,
+	// Timers lifted out of `timers` for the tick currently being applied. A
+	// World field rather than a local so the per-tick scratch costs no
+	// allocation, and so cancel_tag can reach it.
+	due:         [dynamic]Timer,
 	events:      Event_Ring,
 	tag_counter: u32,
 
@@ -98,6 +115,13 @@ World :: struct {
 	// than shell state: it is part of what a save or a replay would need, and
 	// it survives moving between hosts.
 	keyring: [dynamic]Cred,
+
+	// How this run ended, if it has. Owned here rather than by the shell so it
+	// survives world_reset and is assertable without a Session.
+	run:       Run_Status,
+	trace:     Trace,
+	noise_log: Noise_Log,
+	hunt_tag:  u32, // groups the hunt's self-rescheduling timers
 
 	// The machine the player operates from; always held at root.
 	origin: Handle(Host),
@@ -129,33 +153,61 @@ world_bind :: proc(w: ^World, seed: u64) {
 	w.now = 0
 	w.origin = {}
 	w.tag_counter = 0
+	w.run = {}
+	w.trace = {}
+	w.noise_log = {}
+	w.hunt_tag = 0
 	ring_clear(&w.events)
 
 	pool_init(&w.hosts, 32, w.allocator)
 	pool_init(&w.subnets, 8, w.allocator)
 	w.links = make([dynamic]Link, 0, 8, w.allocator)
 	w.timers = make([dynamic]Timer, 0, 32, w.allocator)
+	w.due = make([dynamic]Timer, 0, 32, w.allocator)
 	w.keyring = make([dynamic]Cred, 0, 8, w.allocator)
 }
 
 // Advance exactly one tick. The only way the world changes with time.
+//
+// Two phases, and the split is load-bearing.
+//
+// Lifting every due timer out before applying any of them means an action is
+// free to schedule, cancel, or clear the timer list without disturbing this
+// batch. Applying in-place while scanning positionally -- which is what this
+// did through M1 -- corrupts same-tick ordering the moment a removal happens
+// below the cursor: everything shifts left and the scan steps over timers that
+// were due. Nothing is lost, but the order changes, and same-tick order is the
+// entire basis for concurrent job output being reproducible.
+//
+// M1 got away with it because no action touched the timer list. M2 adds three
+// that do.
 tick :: proc(w: ^World) {
 	w.now += 1
 
-	// Ordered removal so timers scheduled for the same tick fire in the order
-	// they were scheduled -- log lines must not arrive shuffled.
+	// Phase 1: lift, in scan order, so same-tick timers stay in schedule order.
+	clear(&w.due)
 	i := 0
 	for i < len(w.timers) {
 		if w.timers[i].fire_at <= w.now {
-			action := w.timers[i].action
+			append(&w.due, w.timers[i])
 			ordered_remove(&w.timers, i)
-			// Removed before applying: an action is free to schedule further
-			// timers without disturbing this scan.
-			apply(w, action)
 		} else {
 			i += 1
 		}
 	}
+
+	// Phase 2: apply.
+	for t in w.due {
+		// An action this tick may have cancelled a later one in the same batch.
+		if t.tag == TAG_CANCELLED {
+			continue
+		}
+		apply(w, t.action)
+	}
+	clear(&w.due)
+
+	suspicion_tick(w)
+	trace_tick(w)
 }
 
 tick_n :: proc(w: ^World, n: int) {
@@ -172,13 +224,30 @@ schedule_tagged :: proc(w: ^World, delay: Tick, a: Action, tag: u32) {
 	append(&w.timers, Timer{fire_at = w.now + delay, action = a, tag = tag})
 }
 
+// Reserved tag marking an entry in `w.due` that was cancelled after being lifted
+// but before being applied. Never minted by next_tag, which starts at 1.
+TAG_CANCELLED :: max(u32)
+
 // Drops every pending timer carrying `tag` and reports how many went. Tag 0 is
 // never matched, so untagged timers cannot be cancelled by accident.
+//
+// Also stamps out matching entries already lifted into `w.due` this tick. Without
+// that, cancellation would only take effect from the *next* tick: an action that
+// severs a route at tick T would still let the doomed job's output, lifted in the
+// same batch, land at tick T.
 cancel_tag :: proc(w: ^World, tag: u32) -> int {
-	if tag == 0 {
+	if tag == 0 || tag == TAG_CANCELLED {
 		return 0
 	}
 	removed := 0
+
+	for &t in w.due {
+		if t.tag == tag {
+			t.tag = TAG_CANCELLED
+			removed += 1
+		}
+	}
+
 	i := 0
 	for i < len(w.timers) {
 		if w.timers[i].tag == tag {
@@ -202,7 +271,12 @@ next_tag :: proc(w: ^World) -> u32 {
 // temporaries freely and the frontend may hold the string for the rest of the
 // run.
 log_line :: proc(w: ^World, text: string, level: Log_Level = .Plain) {
-	ring_push(&w.events, Ev_Log{text = strings.clone(text, w.allocator), level = level})
+	log_line_as(w, text, level, 0)
+}
+
+// Emit a line attributed to a background job. See Ev_Log.job.
+log_line_as :: proc(w: ^World, text: string, level: Log_Level, job: u16) {
+	ring_push(&w.events, Ev_Log{text = strings.clone(text, w.allocator), level = level, job = job})
 }
 
 log_at :: proc(w: ^World, delay: Tick, text: string, level: Log_Level = .Plain) {
@@ -218,6 +292,19 @@ discover_host :: proc(w: ^World, h: Handle(Host)) {
 	if !ok || host.discovered {
 		return
 	}
+	// Re-checked at the moment the result lands, not just when the scan was
+	// launched. A backgrounded scan whose pivot has since been severed must
+	// stop producing findings -- these are state changes, so a stale one would
+	// assert that a discovery genuinely happened.
+	//
+	// This does conflate two things that are genuinely distinct: knowing a host
+	// exists, and being able to reach it. Learning of a box from a config file
+	// needs no route. Nothing does that yet; when something does, it should set
+	// `discovered` through its own path rather than weakening this guard, which
+	// exists specifically to stop *scan results* outliving their route.
+	if !subnet_reachable(w, host.subnet) {
+		return
+	}
 	host.discovered = true
 	ring_push(&w.events, Ev_Host_Discovered{host = h})
 }
@@ -227,7 +314,7 @@ discover_service :: proc(w: ^World, h: Handle(Host), index: int) {
 	if !ok || index < 0 || index >= len(host.services) {
 		return
 	}
-	if host.services[index].discovered {
+	if host.services[index].discovered || !subnet_reachable(w, host.subnet) {
 		return
 	}
 	host.services[index].discovered = true
@@ -242,12 +329,35 @@ grant_access :: proc(w: ^World, h: Handle(Host), level: Access) {
 		return
 	}
 	host.access = level
+	host.access_at = w.now
 	ring_push(&w.events, Ev_Access_Gained{host = h, level = level})
+}
+
+// Takes access away. The counterpart grant_access deliberately lacked, because
+// until M2 nothing could go backwards.
+//
+// Because subnet_reachable is a live query rather than a cached flag, losing a
+// jump box severs everything behind it with no invalidation logic at all -- the
+// foresight in network.odin finally paying off.
+revoke_access :: proc(w: ^World, h: Handle(Host), to: Access) {
+	host, ok := pool_get(&w.hosts, h)
+	if !ok || host.access <= to {
+		return
+	}
+	was := host.access
+	host.access = to
+	ring_push(&w.events, Ev_Access_Lost{host = h, was = was})
 }
 
 // --- construction -----------------------------------------------------------
 
-add_subnet :: proc(w: ^World, name: string, base: Addr, mask_bits: u8) -> Handle(Subnet) {
+add_subnet :: proc(
+	w: ^World,
+	name: string,
+	base: Addr,
+	mask_bits: u8,
+	monitoring := Monitoring.Medium,
+) -> Handle(Subnet) {
 	return pool_add(
 		&w.subnets,
 		Subnet {
@@ -255,6 +365,7 @@ add_subnet :: proc(w: ^World, name: string, base: Addr, mask_bits: u8) -> Handle
 			base = base,
 			mask_bits = mask_bits,
 			hosts = make([dynamic]Handle(Host), 0, 8, w.allocator),
+			monitoring = monitoring,
 		},
 	)
 }
@@ -294,10 +405,21 @@ harvest_file :: proc(w: ^World, h: Handle(Host), index: int) {
 	if !ok || index < 0 || index >= len(host.files) {
 		return
 	}
+	if !subnet_reachable(w, host.subnet) {
+		return
+	}
 	f := &host.files[index]
 	f.found = true
 	for c in f.creds {
 		keyring_add(w, Cred{username = c.username, password = c.password, note = c.note})
+	}
+
+	// Every route onto a file -- cat on a shell, curl over http, and whatever
+	// later tools do -- flows through here, so the win condition is correct
+	// through all of them for the cost of one bool.
+	if f.objective {
+		log_line(w, "[+] objective recovered", .Good)
+		end_run(w, .Extracted)
 	}
 }
 
