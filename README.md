@@ -104,6 +104,15 @@ to retrofit once tools and gameplay exist.
    `nmap` and `ssh` live, and therefore the one place someone might be tempted
    to make one of them real. The gate makes that a build failure, and it covers
    level content too.
+
+   The gate is **deny-by-default** — every directory under `src/` is inside it
+   unless explicitly exempted, so a package added later cannot be ungated by
+   accident. And the gate itself is tested: `build.sh gate` runs a self-test of
+   17 classes before it runs. That is not ceremony. Through M3 the gate accepted
+   `foreign import libc "system:c"` — a complete route to `socket(2)` needing no
+   import statement at all — along with `fmt.printfln`, aliased imports like
+   `import os7 "core:os"`, and any newly added package. Writing the self-test is
+   how those were found.
 2. **The sim does not render.** It appends to an event ring; the frontend drains
    it. Enforced by Odin's import rules.
 3. **The sim is deterministic.** It advances only via `sim.tick()` at a fixed
