@@ -17,6 +17,7 @@ Action :: union {
 	Act_Discover_Host,
 	Act_Discover_Service,
 	Act_Grant_Access,
+	Act_Harvest_File,
 }
 
 Act_Log :: struct {
@@ -38,12 +39,22 @@ Act_Grant_Access :: struct {
 	level: Access,
 }
 
+Act_Harvest_File :: struct {
+	host:  Handle(Host),
+	index: int,
+}
+
 // This is the seed of the job system: "nmap finishes in 8 seconds" is a timer,
 // and so is "the trace advances a notch". Scheduling against tick counts rather
 // than wall-clock is what keeps a real-time game deterministic.
+//
+// `tag` groups the timers belonging to one operation so they can be cancelled
+// together. A running tool schedules all of its output under a single tag;
+// interrupting it is one cancel_tag call. M2's `kill %1` is the same mechanism.
 Timer :: struct {
 	fire_at: Tick,
 	action:  Action,
+	tag:     u32, // 0 = untagged, never matched by cancel_tag
 }
 
 apply :: proc(w: ^World, a: Action) {
@@ -56,6 +67,8 @@ apply :: proc(w: ^World, a: Action) {
 		discover_service(w, act.host, act.index)
 	case Act_Grant_Access:
 		grant_access(w, act.host, act.level)
+	case Act_Harvest_File:
+		harvest_file(w, act.host, act.index)
 	}
 }
 
@@ -77,8 +90,14 @@ World :: struct {
 	subnets: Pool(Subnet),
 	links:   [dynamic]Link,
 
-	timers: [dynamic]Timer,
-	events: Event_Ring,
+	timers:      [dynamic]Timer,
+	events:      Event_Ring,
+	tag_counter: u32,
+
+	// Credentials the player has obtained, from any source. Run state rather
+	// than shell state: it is part of what a save or a replay would need, and
+	// it survives moving between hosts.
+	keyring: [dynamic]Cred,
 
 	// The machine the player operates from; always held at root.
 	origin: Handle(Host),
@@ -109,12 +128,14 @@ world_bind :: proc(w: ^World, seed: u64) {
 	w.rng = rng_seed(seed)
 	w.now = 0
 	w.origin = {}
+	w.tag_counter = 0
 	ring_clear(&w.events)
 
 	pool_init(&w.hosts, 32, w.allocator)
 	pool_init(&w.subnets, 8, w.allocator)
 	w.links = make([dynamic]Link, 0, 8, w.allocator)
 	w.timers = make([dynamic]Timer, 0, 32, w.allocator)
+	w.keyring = make([dynamic]Cred, 0, 8, w.allocator)
 }
 
 // Advance exactly one tick. The only way the world changes with time.
@@ -145,6 +166,36 @@ tick_n :: proc(w: ^World, n: int) {
 
 schedule :: proc(w: ^World, delay: Tick, a: Action) {
 	append(&w.timers, Timer{fire_at = w.now + delay, action = a})
+}
+
+schedule_tagged :: proc(w: ^World, delay: Tick, a: Action, tag: u32) {
+	append(&w.timers, Timer{fire_at = w.now + delay, action = a, tag = tag})
+}
+
+// Drops every pending timer carrying `tag` and reports how many went. Tag 0 is
+// never matched, so untagged timers cannot be cancelled by accident.
+cancel_tag :: proc(w: ^World, tag: u32) -> int {
+	if tag == 0 {
+		return 0
+	}
+	removed := 0
+	i := 0
+	for i < len(w.timers) {
+		if w.timers[i].tag == tag {
+			ordered_remove(&w.timers, i)
+			removed += 1
+		} else {
+			i += 1
+		}
+	}
+	return removed
+}
+
+// Monotonic per run, so a tag is never reused while its timers are still
+// pending. Starts at 1 because 0 means "untagged".
+next_tag :: proc(w: ^World) -> u32 {
+	w.tag_counter += 1
+	return w.tag_counter
 }
 
 // Emit a line now. The text is cloned into the arena, so callers may pass
@@ -231,6 +282,117 @@ add_host :: proc(
 		append(&sn.hosts, h)
 	}
 	return h
+}
+
+// Marks a file as read and takes anything it discloses.
+//
+// Single entry point so every way of reading a file -- `cat` on a shell,
+// `curl` over http, and whatever later tools do -- has identical consequences.
+// A file that leaks a password should leak it however you got at it.
+harvest_file :: proc(w: ^World, h: Handle(Host), index: int) {
+	host, ok := pool_get(&w.hosts, h)
+	if !ok || index < 0 || index >= len(host.files) {
+		return
+	}
+	f := &host.files[index]
+	f.found = true
+	for c in f.creds {
+		keyring_add(w, Cred{username = c.username, password = c.password, note = c.note})
+	}
+}
+
+// Adds a credential to the keyring, ignoring exact duplicates. Re-reading the
+// same config file must not stack up identical entries.
+//
+// Deduplication is on username+password, not on `note`: the same credential
+// found in two places is one credential, and the first place you found it is
+// the one worth remembering.
+keyring_add :: proc(w: ^World, c: Cred) -> bool {
+	for existing in w.keyring {
+		if existing.username == c.username && existing.password == c.password {
+			return false
+		}
+	}
+	append(
+		&w.keyring,
+		Cred {
+			username = strings.clone(c.username, w.allocator),
+			password = strings.clone(c.password, w.allocator),
+			note = strings.clone(c.note, w.allocator),
+		},
+	)
+	ring_push(&w.events, Ev_Cred_Obtained{index = len(w.keyring) - 1})
+	return true
+}
+
+// Every credential the player holds that matches an account on `h`. This is
+// password reuse doing its work: no cross-host bookkeeping, just a string
+// comparison against whatever the target actually accepts.
+keyring_matches :: proc(w: ^World, h: Handle(Host), out: ^[dynamic]Cred) {
+	clear(out)
+	host, ok := pool_get(&w.hosts, h)
+	if !ok {
+		return
+	}
+	for c in w.keyring {
+		for acct in host.accounts {
+			if acct.username == c.username && acct.password == c.password {
+				append(out, c)
+				break
+			}
+		}
+	}
+}
+
+@(private)
+concat :: proc(w: ^World, parts: ..string) -> string {
+	return strings.concatenate(parts, w.allocator)
+}
+
+add_account :: proc(w: ^World, h: Handle(Host), a: Account) {
+	host, ok := pool_get(&w.hosts, h)
+	if !ok {
+		return
+	}
+	acct := a
+	acct.username = strings.clone(a.username, w.allocator)
+	acct.password = strings.clone(a.password, w.allocator)
+	acct.pw_hash = strings.clone(a.pw_hash, w.allocator)
+	append(&host.accounts, acct)
+}
+
+add_file :: proc(w: ^World, h: Handle(Host), f: File, creds: []Cred = nil) {
+	host, ok := pool_get(&w.hosts, h)
+	if !ok {
+		return
+	}
+	file := f
+	file.path = strings.clone(f.path, w.allocator)
+	file.content = strings.clone(f.content, w.allocator)
+	if file.size == 0 {
+		file.size = len(file.content)
+	}
+
+	if len(creds) > 0 {
+		owned := make([]Cred, len(creds), w.allocator)
+		for c, i in creds {
+			// Default the provenance note to where the credential was found.
+			// Callers almost always want exactly this, and a keyring of a dozen
+			// entries is unusable without it.
+			note := c.note
+			if len(note) == 0 {
+				note = concat(w, host.hostname, ":", file.path)
+			}
+			owned[i] = Cred {
+				username = strings.clone(c.username, w.allocator),
+				password = strings.clone(c.password, w.allocator),
+				note     = strings.clone(note, w.allocator),
+			}
+		}
+		file.creds = owned
+	}
+
+	append(&host.files, file)
 }
 
 add_service :: proc(w: ^World, h: Handle(Host), s: Service) {

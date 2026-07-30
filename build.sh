@@ -34,50 +34,64 @@ if [ -z "${ODIN_CLANG_PATH:-}" ] && ! command -v clang >/dev/null 2>&1; then
     fi
 fi
 
-# The sim must never touch the outside world.
+# Packages that must remain incapable of touching the outside world.
 #
 # This is the invariant that keeps "built off real-world scenarios, but not
-# actual hacking" true by construction rather than by good intentions: the
-# simulation cannot open a socket, read a file or spawn a process, because it
-# cannot even name the packages that would let it. It is also what makes the
-# sim deterministic and testable.
+# actual hacking" true by construction rather than by good intentions: these
+# packages cannot open a socket, read a file or spawn a process, because they
+# cannot even name the packages that would let them. It is also what makes the
+# simulation deterministic and testable.
 #
-# Enforced here rather than trusted to code review, because the cost of noticing
-# late is a rewrite.
+# `shell` matters even more than `sim` here: it is where the commands named
+# nmap and ssh live, and therefore the one place where someone -- a
+# contributor, a future me, a model -- might be tempted to make one of them
+# real. A build failure is a better guard than a code review, because the cost
+# of noticing late is not a rewrite but a genuinely harmful program.
+PURE_PACKAGES="src/sim src/shell src/input"
+
 purity_gate() {
     local violations=0
 
-    # Forbidden imports. core:fmt is deliberately allowed -- string formatting
-    # is pure -- but its printing procedures are not, and are checked below.
-    if grep -rnE '^[[:space:]]*import[[:space:]]+([a-zA-Z_]+[[:space:]]+)?"(core:(net|os|os/os2|sys|c|c/libc|thread|prof)|vendor:|system:)' src/sim/ 2>/dev/null; then
-        echo "  ^ sim must not import I/O, platform or vendor packages" >&2
-        violations=1
-    fi
+    for pkg in $PURE_PACKAGES; do
+        [ -d "$pkg" ] || continue
 
-    # Printing is I/O even when it comes from an allowed package.
-    if grep -rnE '\bfmt\.(print|println|printf|eprint|eprintln|eprintf)\b' src/sim/ 2>/dev/null; then
-        echo "  ^ sim must not print; emit an Event instead" >&2
-        violations=1
-    fi
+        # Forbidden imports. core:fmt is deliberately allowed -- string
+        # formatting is pure -- but its printing procedures are not, and are
+        # checked below.
+        if grep -rnE '^[[:space:]]*import[[:space:]]+([a-zA-Z_]+[[:space:]]+)?"(core:(net|os|os/os2|sys|c|c/libc|thread|prof)|vendor:|system:)' "$pkg" 2>/dev/null; then
+            echo "  ^ $pkg must not import I/O, platform or vendor packages" >&2
+            violations=1
+        fi
 
-    # The sim/render seam. Odin already rejects import cycles, but this catches
-    # the mistake with a useful message instead of a cycle error.
-    if grep -rnE '^[[:space:]]*import[[:space:]]+([a-zA-Z_]+[[:space:]]+)?"[^"]*\bui\b' src/sim/ 2>/dev/null; then
-        echo "  ^ sim must not know about the renderer" >&2
-        violations=1
-    fi
+        # Printing is I/O even when it comes from an allowed package.
+        if grep -rnE '\bfmt\.(print|println|printf|eprint|eprintln|eprintf)\b' "$pkg" 2>/dev/null; then
+            echo "  ^ $pkg must not print; emit an Event instead" >&2
+            violations=1
+        fi
+
+        # The logic/render seam. Odin already rejects import cycles, but this
+        # catches the mistake with a useful message instead of a cycle error.
+        if grep -rnE '^[[:space:]]*import[[:space:]]+([a-zA-Z_]+[[:space:]]+)?"[^"]*/ui"' "$pkg" 2>/dev/null; then
+            echo "  ^ $pkg must not know about the renderer" >&2
+            violations=1
+        fi
+    done
 
     if [ "$violations" -ne 0 ]; then
         echo "PURITY GATE FAILED" >&2
         exit 1
     fi
-    echo "  purity gate ..... ok  (sim/ is I/O-free)"
+    echo "  purity gate ..... ok  ($(echo $PURE_PACKAGES | tr ' ' ',') are I/O-free)"
 }
 
 do_check() {
     echo "checking:"
+    "$ODIN" check src/input -no-entry-point
+    echo "  src/input ....... ok"
     "$ODIN" check src/sim -no-entry-point
     echo "  src/sim ......... ok"
+    "$ODIN" check src/shell -no-entry-point
+    echo "  src/shell ....... ok"
     "$ODIN" check src/ui -no-entry-point
     echo "  src/ui .......... ok"
     "$ODIN" check src

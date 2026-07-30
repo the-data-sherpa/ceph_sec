@@ -10,9 +10,10 @@ can't**: the simulation package is mechanically forbidden from importing any I/O
 platform, or vendor package, and `./build.sh gate` fails the build if that ever
 changes.
 
-> **Status: milestone 0 — engine foundation.** The simulation core, fixed-tick
-> scheduler, event pipeline and CRT renderer are live and tested. There is no
-> command input yet, so there is nothing to play. It compiles, and it glows.
+> **Status: milestone 1 — the terminal works.** You can type into it. A short
+> run is playable end to end: scan the DMZ, find an exposed `.env`, reuse the
+> password it leaks to take the jump box, pivot into the internal segment and
+> recover the objective. No trace pressure or background jobs yet — those are M2.
 
 ## Setup
 
@@ -42,11 +43,13 @@ and honours `ODIN=` if it lives elsewhere.
 ./build.sh all        # check + test + build
 ```
 
-While running: `F1` CRT on/off · `F2` curved/flat · `F3` theme · `F12` screenshot
-· `ESC` quit.
+While running, type `help`. `^C` interrupts a running command, `PgUp`/`PgDn`
+scroll, and `↑`/`↓` walk history. Display: `F1` CRT on/off · `F2` curved/flat ·
+`F3` theme · `F12` screenshot · `ESC` quit.
 
 ```sh
-./build/cephsec --shot 12.5 frame.png   # run to a fixed tick, capture, exit
+./build/cephsec --shot 12.5 frame.png            # run to a tick, capture, exit
+./build/cephsec --exec "nmap -sV 10.0.4.0/24"    # run commands at startup
 ```
 
 Because the sim is deterministic *and* the shader's time uniform is driven from
@@ -59,25 +62,31 @@ are not honoured.
 
 ## Layout
 
-A directory is a package in Odin, and imports may only point downward:
-`sim ← ui ← main`. Odin rejects import cycles outright, so the architecture is
-compiler-enforced rather than documented and hoped for.
+A directory is a package in Odin, and imports may only point downward.
 
 ```
-src/sim/     simulation core — pure, deterministic, no I/O, no raylib
+src/sim/     simulation core — world, scheduler, events. Pure and deterministic.
+src/shell/   parsing, commands, tools. Pure — nmap and ssh live here.
+src/input/   shared key vocabulary. No dependencies at all.
 src/ui/      character grid, terminal, CRT pipeline — the only raylib consumer
-src/main.odin  wires the two together and owns the frame loop
-tests/       sim test suite (odin test)
+src/main.odin  wires them together, owns the frame loop and the scenario
+tests/       sim + shell suites (odin test)
 assets/      crt.fs and future content
 docs/        design.md — the systems bible
 ```
+
+`sim ← shell ← main → ui`, with `input` as a shared leaf. Odin rejects import
+cycles, so the direction is compiler-enforced.
 
 ### The three invariants
 
 Established now because they cost nothing at this size and would be a rewrite
 to retrofit once tools and gameplay exist.
 
-1. **The sim performs no I/O.** Enforced by `build.sh gate`, not convention.
+1. **The sim and shell perform no I/O.** Enforced by `build.sh gate`, not
+   convention. This matters most for `shell`: it is where the commands named
+   `nmap` and `ssh` live, and therefore the one place someone might be tempted
+   to make one of them real. The gate makes that a build failure.
 2. **The sim does not render.** It appends to an event ring; the frontend drains
    it. Enforced by Odin's import rules.
 3. **The sim is deterministic.** It advances only via `sim.tick()` at a fixed
@@ -95,7 +104,7 @@ would silently invalidate every seed ever shared without breaking a build.
 | | |
 | --- | --- |
 | **M0** | engine foundation — sim core, scheduler, events, CRT pipeline ✅ |
-| M1 | terminal input, command parser, first tools |
+| **M1** | terminal input, command parser, first tools ✅ |
 | M2 | async jobs and trace pressure — the run becomes losable |
 | M3 | procedural network generation with attack-graph solvability proof |
 | M4 | net map, exfil objectives, run-end |

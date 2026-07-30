@@ -1,7 +1,10 @@
 # Ceph.Sec — systems design
 
-The reference the post-M0 milestones build toward. Anything here beyond
-milestone 0 is intent, not implementation.
+The reference the remaining milestones build toward. Entries marked ✅ are
+implemented; everything else is intent, not implementation.
+
+Noise values are documented targets — the trace system that consumes them
+arrives in M2, so nothing charges for noise yet.
 
 ---
 
@@ -142,8 +145,8 @@ values to tune, not commitments.
 
 | Tool | Effect | Time | Noise |
 | --- | --- | --- | --- |
-| `nmap -sn` | host discovery, no ports | 6s | 8 |
-| `nmap -sV` | versions — the good stuff | 14s | 22 |
+| `nmap -sn` ✅ | host discovery, no ports | 6s | 8 |
+| `nmap -sV` ✅ | versions — the good stuff | 14s | 22 |
 | `nmap -sS -T2` | same, slow and quiet | 50s | 6 |
 | `tcpdump` | passive; yields creds/hosts over time | passive | 0 |
 | `arp -a` | neighbours, from a held host | 1s | 1 |
@@ -154,10 +157,17 @@ values to tune, not commitments.
 
 | Tool | Effect | Time | Noise |
 | --- | --- | --- | --- |
+| `curl` ✅ | fetch a page or file from a web root | 1.1s | 10 |
 | `gobuster` | web paths | 20s | 25 |
 | `enum4linux` | SMB shares, users | 12s | 18 |
 | `searchsploit` | vulns for seen versions — **offline** | 1s | 0 |
 | `ldapsearch` | directory objects | 8s | 12 |
+
+`curl` earns its place early because it is the only tool that yields anything
+without a credential, and so is where a run starts. The M1 scenario turns on a
+`.env` left in a document root and a leftover comment on the index page naming
+it — two of the most common real findings there are, and between them the entry
+point is *discoverable* rather than guessable.
 
 ### Access
 
@@ -166,7 +176,7 @@ values to tune, not commitments.
 | `hydra` | credential brute force | 30–90s | 45 |
 | `sqlmap` | injection → data or shell | 25s | 30 |
 | `msfconsole` | exploit a matched vuln | 8s | 35 |
-| `ssh` | log in with creds you hold | 2s | 5 / 20 failed |
+| `ssh` ✅ | log in with creds you hold | 2s | 5 / 20 failed |
 
 ### Post-exploitation
 

@@ -3,6 +3,9 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:strconv"
+import "core:strings"
+import "input"
+import "shell"
 import "sim"
 import "ui"
 
@@ -11,46 +14,18 @@ GRID_H :: 38
 
 SEED :: 0xCEF5EC
 
-// Milestone 0 has no gameplay. What it does have is the full spine wired up
-// end to end -- seed -> world -> fixed-tick scheduler -> event ring -> terminal
-// -> character grid -> offscreen buffer -> CRT shader -> window. The boot
-// sequence below exists to exercise every link in that chain so the foundation
-// is visually verifiable and not merely compiling.
-
-// `cephsec --shot <seconds> [path]` runs to a fixed point on the sim clock,
-// writes a screenshot and exits. Because the sim is deterministic, the same
-// seed and the same tick count always produce the same frame -- so this is a
-// visual regression check, not just a convenience. For a game whose look is
-// carried by a shader, that is worth having from the start.
-Autoshot :: struct {
-	enabled: bool,
-	at:      sim.Tick,
-	path:    cstring,
-}
-
-parse_autoshot :: proc() -> Autoshot {
-	args := os.args
-	for i in 1 ..< len(args) {
-		if args[i] != "--shot" {
-			continue
-		}
-		secs := 6.0
-		if i + 1 < len(args) {
-			if v, ok := strconv.parse_f64(args[i + 1]); ok {
-				secs = v
-			}
-		}
-		path: cstring = "cephsec.png"
-		if i + 2 < len(args) && len(args[i + 2]) > 0 && args[i + 2][0] != '-' {
-			path = fmt.caprintf("%s", args[i + 2])
-		}
-		return {enabled = true, at = sim.seconds(secs), path = path}
-	}
-	return {}
-}
+// M1: the terminal accepts input.
+//
+// The spine from M0 is unchanged -- seed -> world -> fixed-tick scheduler ->
+// event ring -> terminal -> grid -> CRT. What is new sits on top: keystrokes
+// become input.Events, the shell parses and dispatches them, and tools schedule
+// their output back through the same scheduler that drove the boot sequence.
+//
+// Commands that reach the network take sim time and hold the prompt. That is
+// the seam M2 opens up into background jobs.
 
 main :: proc() {
-	shot := parse_autoshot()
+	opts := parse_args()
 
 	w: sim.World
 	if err := sim.world_init(&w, SEED); err != nil {
@@ -59,8 +34,10 @@ main :: proc() {
 	}
 	defer sim.world_destroy(&w)
 
-	build_demo(&w)
-	scheduled_total := len(w.timers)
+	origin := build_scenario(&w)
+
+	sess: shell.Session
+	shell.session_init(&sess, &w, origin, "operator")
 
 	app: ui.App
 	ui.app_init(&app, "Ceph.Sec", GRID_W, GRID_H, "assets/shaders/crt.fs")
@@ -70,12 +47,16 @@ main :: proc() {
 		fmt.eprintln("warning: crt.fs failed to load; rendering without the screen effect")
 	}
 
-	term: ui.Term
-	ui.term_push(&term, "", .Dim)
+	keys: ui.Input_State
+	ui.input_init(&keys)
+	defer ui.input_destroy(&keys)
 
-	// Real-time is a property of the frontend: it converts wall-clock delta into
-	// a whole number of fixed ticks. The sim never sees a clock, which is what
-	// keeps a real-time game reproducible from its seed.
+	term: ui.Term
+	greeting(&w)
+
+	// Commands queued by --exec, fed in one at a time as the shell frees up.
+	next_queued := 0
+
 	accumulator: f64
 
 	for !ui.app_should_close(&app) {
@@ -90,21 +71,119 @@ main :: proc() {
 			sim.tick(&w)
 			accumulator -= sim.TICK_DT
 		}
+		shell.session_update(&sess)
+
+		for ev in ui.poll_input(&keys, dt) {
+			if scroll, is_scroll := ev.(input.Scroll); is_scroll {
+				ui.term_scroll_by(&term, scroll.lines, GRID_H - 7)
+				continue
+			}
+			if key, is_key := ev.(input.Key_Pressed); is_key {
+				#partial switch key.key {
+				case .Page_Up:
+					ui.term_scroll_by(&term, 10, GRID_H - 7)
+					continue
+				case .Page_Down:
+					ui.term_scroll_by(&term, -10, GRID_H - 7)
+					continue
+				case .Ctrl_L:
+					ui.term_clear(&term)
+					continue
+				}
+			}
+			if shell.session_input(&sess, ev) {
+				ui.term_scroll_to_bottom(&term)
+			}
+		}
+
+		// Feed the next scripted command once the shell is idle.
+		if next_queued < len(opts.exec) && !shell.session_busy(&sess) {
+			shell.session_exec(&sess, opts.exec[next_queued])
+			next_queued += 1
+		}
+
+		if sess.should_quit {
+			break
+		}
 
 		drain_events(&w, &term)
-		layout(&app, &w, &term, scheduled_total)
-		// Sim time, not wall time -- see crt_set_time.
+		layout(&app, &w, &sess, &term)
 		ui.app_render(&app, f32(sim.tick_seconds(w.now)))
 
-		if shot.enabled && w.now >= shot.at {
-			ui.app_capture(&app, shot.path)
-			fmt.printfln("wrote %s at tick %d", shot.path, u64(w.now))
+		if opts.shot.enabled && w.now >= opts.shot.at {
+			ui.app_capture(&app, opts.shot.path)
+			fmt.printfln("wrote %s at tick %d", opts.shot.path, u64(w.now))
 			break
 		}
 
 		free_all(context.temp_allocator)
 	}
 }
+
+// --- arguments --------------------------------------------------------------
+
+Options :: struct {
+	shot: Autoshot,
+	exec: []string,
+}
+
+// `--shot <seconds> [path]` runs to a fixed point on the sim clock, writes a
+// screenshot and exits. Because the sim is deterministic and the shader's time
+// uniform is driven from the sim clock, the same seed and tick always produce
+// the same image -- so this is a visual regression check, not a convenience.
+Autoshot :: struct {
+	enabled: bool,
+	at:      sim.Tick,
+	path:    cstring,
+}
+
+parse_args :: proc() -> Options {
+	opts: Options
+	args := os.args
+
+	for i := 1; i < len(args); i += 1 {
+		switch args[i] {
+		case "--shot":
+			secs := 6.0
+			if i + 1 < len(args) {
+				if v, ok := strconv.parse_f64(args[i + 1]); ok {
+					secs = v
+					i += 1
+				}
+			}
+			path: cstring = "cephsec.png"
+			if i + 1 < len(args) && len(args[i + 1]) > 0 && args[i + 1][0] != '-' {
+				path = fmt.caprintf("%s", args[i + 1])
+				i += 1
+			}
+			opts.shot = {
+				enabled = true,
+				at      = sim.seconds(secs),
+				path    = path,
+			}
+
+		// `--exec "nmap -sV 10.0.4.0/24; cat /home/svc/deploy.env"` drives the
+		// shell from the command line. Makes the whole loop scriptable, which is
+		// what lets a screenshot capture a real session rather than a mock-up.
+		case "--exec":
+			if i + 1 < len(args) {
+				i += 1
+				parts := strings.split(args[i], ";")
+				cleaned := make([dynamic]string, 0, len(parts))
+				for p in parts {
+					trimmed := strings.trim_space(p)
+					if len(trimmed) > 0 {
+						append(&cleaned, trimmed)
+					}
+				}
+				opts.exec = cleaned[:]
+			}
+		}
+	}
+	return opts
+}
+
+// --- event drain ------------------------------------------------------------
 
 // The one place sim vocabulary is translated into presentation vocabulary.
 // Keeping it here is what lets `ui` stay a general text-mode toolkit that knows
@@ -117,6 +196,10 @@ level_color :: proc(l: sim.Log_Level) -> ui.Color_Id {
 		return .Dim
 	case .Cmd:
 		return .Bright
+	case .Heading:
+		return .Bright
+	case .Data:
+		return .Accent
 	case .Good:
 		return .Good
 	case .Warn:
@@ -133,49 +216,26 @@ drain_events :: proc(w: ^sim.World, term: ^ui.Term) {
 		if !ok {
 			break
 		}
-		switch ev in e {
+		#partial switch ev in e {
 		case sim.Ev_Log:
+			// `clear` reaches the frontend as a sentinel rather than an event
+			// type: what the scrollback does is not something the world models.
+			if ev.text == shell.CLEAR_SENTINEL {
+				ui.term_clear(term)
+				continue
+			}
 			// Safe to store by reference: sim cloned this into the run arena.
 			ui.term_push(term, ev.text, level_color(ev.level))
 
-		case sim.Ev_Host_Discovered:
-			if h, found := sim.pool_get(&w.hosts, ev.host); found {
-				buf: [15]u8
+		case sim.Ev_Cred_Obtained:
+			// Discovery events are narrated by the tool that caused them, so
+			// they need no line here. Credentials get one, because acquiring
+			// one is the most consequential thing that happens in a run.
+			if ev.index < len(w.keyring) {
+				c := w.keyring[ev.index]
 				ui.term_push(
 					term,
-					fmt.aprintf(
-						"  %-15s  %s",
-						sim.addr_write(buf[:], h.address),
-						h.hostname,
-						allocator = w.allocator,
-					),
-					.Bright,
-				)
-			}
-
-		case sim.Ev_Service_Discovered:
-			if h, found := sim.pool_get(&w.hosts, ev.host); found {
-				s := h.services[ev.index]
-				ui.term_push(
-					term,
-					fmt.aprintf(
-						"      %d/%s  %-8s  %s %s",
-						s.port,
-						"tcp" if s.proto == .TCP else "udp",
-						s.name,
-						s.product,
-						s.version,
-						allocator = w.allocator,
-					),
-					.Accent,
-				)
-			}
-
-		case sim.Ev_Access_Gained:
-			if h, found := sim.pool_get(&w.hosts, ev.host); found {
-				ui.term_push(
-					term,
-					fmt.aprintf("  [+] %s -> %v", h.hostname, ev.level, allocator = w.allocator),
+					fmt.aprintf("    %s / %s", c.username, c.password, allocator = w.allocator),
 					.Good,
 				)
 			}
@@ -185,37 +245,59 @@ drain_events :: proc(w: ^sim.World, term: ^ui.Term) {
 
 // --- presentation -----------------------------------------------------------
 
-layout :: proc(app: ^ui.App, w: ^sim.World, term: ^ui.Term, scheduled_total: int) {
+layout :: proc(app: ^ui.App, w: ^sim.World, sess: ^shell.Session, term: ^ui.Term) {
 	g := &app.grid
 	ui.grid_clear(g)
 
-	header(g, w)
+	header(g, w, sess)
 
 	body_h := GRID_H - 4
 	term_w := 66
 
 	ui.grid_panel(g, 0, 1, term_w, body_h, "term")
-	ui.term_draw(term, g, 2, 2, term_w - 4, body_h - 2)
+
+	// The input line takes the last row of the pane; scrollback gets the rest.
+	scroll_h := body_h - 3
+	ui.term_draw(term, g, 2, 2, term_w - 4, scroll_h)
+
+	// ~1.6 Hz, driven off sim time so it stays deterministic for screenshots.
+	blink := int(sim.tick_seconds(w.now) * 1.6) % 2 == 0
+	ui.term_draw_input(
+		g,
+		2,
+		2 + scroll_h,
+		term_w - 4,
+		shell.prompt(sess, context.temp_allocator),
+		shell.line_text(&sess.line, context.temp_allocator),
+		sess.line.cursor,
+		shell.session_busy(sess),
+		blink,
+	)
 
 	side_x := term_w
 	side_w := GRID_W - term_w
 	ui.grid_panel(g, side_x, 1, side_w, body_h, "session")
-	session_panel(g, w, side_x + 2, 3, side_w - 4, scheduled_total)
+	session_panel(g, w, sess, side_x + 2, 3, side_w - 4)
 
-	footer(g, app)
+	footer(g, app, term)
 }
 
-header :: proc(g: ^ui.Grid, w: ^sim.World) {
+header :: proc(g: ^ui.Grid, w: ^sim.World, sess: ^shell.Session) {
 	ui.grid_fill(g, 0, 0, GRID_W, 1, ' ', .Bright, .Bg_Panel)
 	ui.grid_write(g, 1, 0, "CEPH.SEC", .Bright, .Bg_Panel, {.Bold})
-	ui.grid_write(g, 10, 0, "milestone 0 -- engine foundation", .Dim, .Bg_Panel)
+
+	if shell.session_busy(sess) {
+		ui.grid_write(g, 10, 0, fmt.tprintf("running %s ...", sess.busy_label), .Warn, .Bg_Panel)
+	} else {
+		ui.grid_write(g, 10, 0, "milestone 1 -- terminal", .Dim, .Bg_Panel)
+	}
 
 	elapsed := sim.tick_seconds(w.now)
 	clock := fmt.tprintf("T+%02d:%02d.%02d", int(elapsed) / 60, int(elapsed) % 60, int(elapsed * 100) % 100)
 	ui.grid_write(g, GRID_W - len(clock) - 1, 0, clock, .Accent, .Bg_Panel)
 }
 
-session_panel :: proc(g: ^ui.Grid, w: ^sim.World, x, y, width: int, scheduled_total: int) {
+session_panel :: proc(g: ^ui.Grid, w: ^sim.World, sess: ^shell.Session, x, y, width: int) {
 	row := y
 
 	field :: proc(g: ^ui.Grid, x, y, width: int, label, value: string, vc: ui.Color_Id = .Bright) {
@@ -223,37 +305,43 @@ session_panel :: proc(g: ^ui.Grid, w: ^sim.World, x, y, width: int, scheduled_to
 		ui.grid_write(g, x + width - len(value), y, value, vc, .Bg_Panel)
 	}
 
-	field(g, x, row, width, "seed", fmt.tprintf("%08x", w.seed), .Accent)
-	row += 1
-	field(g, x, row, width, "tick", fmt.tprintf("%d", u64(w.now)))
-	row += 2
-
-	// Real progress, read straight off the scheduler: how many of the boot
-	// sequence's deferred events have fired.
-	fired := scheduled_total - len(w.timers)
-	frac := f32(fired) / f32(max(scheduled_total, 1))
-	ui.grid_write(g, x, row, "boot sequence", .Dim, .Bg_Panel)
-	row += 1
-	ui.grid_meter(g, x, row, width, frac, .Good, .Bg_Panel)
-	row += 1
-	pct := fmt.tprintf("%d%%", int(frac * 100))
-	ui.grid_write(g, x + width - len(pct), row, pct, .Good, .Bg_Panel)
-	row += 2
-
-	ui.grid_write(g, x, row, "world", .Dim, .Bg_Panel)
-	row += 1
-	field(g, x, row, width, " subnets", fmt.tprintf("%d", sim.pool_len(&w.subnets)))
-	row += 1
-	field(g, x, row, width, " hosts", fmt.tprintf("%d", sim.pool_len(&w.hosts)))
-	row += 1
+	if h, ok := sim.pool_get(&w.hosts, sess.host); ok {
+		buf: [15]u8
+		ui.grid_write(g, x, row, "shell on", .Dim, .Bg_Panel)
+		row += 1
+		ui.grid_write(g, x, row, h.hostname, .Bright, .Bg_Panel, {.Bold})
+		addr := sim.addr_write(buf[:], h.address)
+		ui.grid_write(g, x + width - len(addr), row, addr, .Accent, .Bg_Panel)
+		row += 1
+		field(g, x, row, width, "access", fmt.tprintf("%v", h.access), h.access == .Root ? .Good : .Bright)
+		row += 2
+	}
 
 	discovered, services, owned := survey(w)
-	field(g, x, row, width, " discovered", fmt.tprintf("%d", discovered))
+	ui.grid_write(g, x, row, "recon", .Dim, .Bg_Panel)
+	row += 1
+	field(g, x, row, width, " hosts seen", fmt.tprintf("%d", discovered))
 	row += 1
 	field(g, x, row, width, " services", fmt.tprintf("%d", services))
 	row += 1
-	field(g, x, row, width, " footholds", fmt.tprintf("%d", owned), .Good if owned > 0 else .Bright)
+	field(g, x, row, width, " footholds", fmt.tprintf("%d", owned), owned > 1 ? .Good : .Bright)
 	row += 2
+
+	ui.grid_write(g, x, row, "keyring", .Dim, .Bg_Panel)
+	row += 1
+	if len(w.keyring) == 0 {
+		ui.grid_write(g, x, row, " (empty)", .Dim, .Bg_Panel)
+		row += 1
+	} else {
+		for c in w.keyring {
+			if row >= GRID_H - 9 {
+				break
+			}
+			ui.grid_write(g, x, row, fmt.tprintf(" %s", c.username), .Good, .Bg_Panel)
+			row += 1
+		}
+	}
+	row += 1
 
 	ui.grid_write(g, x, row, "segments", .Dim, .Bg_Panel)
 	row += 1
@@ -265,13 +353,10 @@ session_panel :: proc(g: ^ui.Grid, w: ^sim.World, x, y, width: int, scheduled_to
 		reachable := sim.subnet_reachable(w, h)
 		ui.grid_write(g, x, row, reachable ? "●" : "○", reachable ? .Good : .Dim, .Bg_Panel)
 		ui.grid_write(g, x + 2, row, sn.name, reachable ? .Bright : .Dim, .Bg_Panel)
-		state := reachable ? "reachable" : "no route"
+		state := reachable ? "up" : "no route"
 		ui.grid_write(g, x + width - len(state), row, state, reachable ? .Good : .Dim, .Bg_Panel)
 		row += 1
 	}
-
-	row += 1
-	field(g, x, row, width, "events lost", fmt.tprintf("%d", w.events.dropped), w.events.dropped > 0 ? .Bad : .Dim)
 }
 
 survey :: proc(w: ^sim.World) -> (discovered, services, owned: int) {
@@ -292,88 +377,136 @@ survey :: proc(w: ^sim.World) -> (discovered, services, owned: int) {
 	return
 }
 
-footer :: proc(g: ^ui.Grid, app: ^ui.App) {
+footer :: proc(g: ^ui.Grid, app: ^ui.App, term: ^ui.Term) {
 	y := GRID_H - 2
 	ui.grid_fill(g, 0, y, GRID_W, 1, ' ', .Dim, .Bg_Panel)
 
-	crt_state := "on" if app.crt_enabled else "off"
-	curve_state := "flat" if app.flat_mode else "curved"
-	hint := fmt.tprintf(
-		"F1 crt:%s   F2 %s   F3 theme:%s   F12 screenshot   ESC quit",
-		crt_state,
-		curve_state,
-		app.theme.name,
-	)
+	hint := "`help` · ^C interrupt · PgUp/PgDn scroll · F1 crt · F3 theme · F12 shot"
 	ui.grid_write(g, 1, y, hint, .Dim, .Bg_Panel)
+
+	if term.scroll > 0 {
+		tag := fmt.tprintf("scrolled %d", term.scroll)
+		ui.grid_write(g, GRID_W - len(tag) - 1, y, tag, .Warn, .Bg_Panel)
+	}
 }
 
-// --- demo content -----------------------------------------------------------
+// --- scenario ---------------------------------------------------------------
 
-// A hand-placed network and a scripted reveal. Procedural generation is M3;
-// this exists purely to drive the engine.
-build_demo :: proc(w: ^sim.World) {
+greeting :: proc(w: ^sim.World) {
+	sim.log_line(w, "ceph.sec // operator console", .Info)
+	sim.log_line(w, "", .Plain)
+	sim.log_line(w, "CONTRACT: NORTHWIND LOGISTICS", .Heading)
+	sim.log_line(w, "Recover /srv/backup/manifest.sql from their file server.", .Plain)
+	sim.log_line(w, "You have root on a rented VPS with a route into their DMZ.", .Plain)
+	sim.log_line(w, "", .Plain)
+	sim.log_line(w, "`help` lists what you can run. Start by finding out what is there.", .Info)
+	sim.log_line(w, "", .Plain)
+}
+
+// The M1 network.
+//
+// The intended path is meant to be *discoverable* rather than guessable:
+// scanning the DMZ finds web01, whose deployment config leaks a service account
+// password. That password is reused on jump01 -- the box bridging into CORP --
+// and jump01's svc account is an admin, so taking it opens the route to the
+// objective. Every step is visible from the step before it.
+build_scenario :: proc(w: ^sim.World) -> sim.Handle(sim.Host) {
+	wan := sim.add_subnet(w, "WAN", sim.addr(198, 51, 100, 0), 24)
 	dmz := sim.add_subnet(w, "DMZ", sim.addr(10, 0, 4, 0), 24)
 	corp := sim.add_subnet(w, "CORP", sim.addr(10, 0, 9, 0), 24)
 
-	gw := sim.add_host(w, "gw-edge", sim.addr(10, 0, 4, 1), dmz, "Linux 4.15")
-	web := sim.add_host(w, "web01", sim.addr(10, 0, 4, 11), dmz, "Linux 4.15")
-	jump := sim.add_host(w, "jump01", sim.addr(10, 0, 4, 19), dmz, "Linux 5.4")
-	fs := sim.add_host(w, "fs01", sim.addr(10, 0, 9, 10), corp, "Windows Server 2016")
+	// The operator's own box. Held at root from the start; it is the thing the
+	// player stands on rather than a target.
+	origin := sim.add_host(w, "ceph", sim.addr(198, 51, 100, 7), wan, "Debian 12")
+	sim.grant_access(w, origin, .Root)
+	w.origin = origin
 
+	sim.add_file(
+		w,
+		origin,
+		{
+			path = "/root/contract.txt",
+			content = "NORTHWIND LOGISTICS -- retrieval\n\ntarget:   /srv/backup/manifest.sql\nnetwork:  10.0.4.0/24 is routable from this host\nnote:     10.0.9.0/24 is not directly routable.\n          find something that bridges the two.\n\nno credentials supplied. start with what they expose.",
+		},
+	)
+	sim.add_file(w, origin, {path = "/root/.ssh/known_hosts", content = "# nothing here yet"})
+
+	// --- DMZ ---------------------------------------------------------------
+
+	gw := sim.add_host(w, "gw-edge", sim.addr(10, 0, 4, 1), dmz, "VyOS 1.2")
 	sim.add_service(w, gw, {port = 22, proto = .TCP, name = "ssh", product = "OpenSSH", version = "7.4"})
+
+	web := sim.add_host(w, "web01", sim.addr(10, 0, 4, 11), dmz, "Ubuntu 18.04")
+	sim.add_service(w, web, {port = 22, proto = .TCP, name = "ssh", product = "OpenSSH", version = "7.6p1"})
 	sim.add_service(w, web, {port = 80, proto = .TCP, name = "http", product = "Apache httpd", version = "2.4.29"})
 	sim.add_service(w, web, {port = 443, proto = .TCP, name = "https", product = "Apache httpd", version = "2.4.29"})
-	sim.add_service(w, jump, {port = 22, proto = .TCP, name = "ssh", product = "OpenSSH", version = "8.2"})
-	sim.add_service(w, fs, {port = 445, proto = .TCP, name = "smb", product = "Samba", version = "4.5.9"})
 
-	// The pivot: CORP is unreachable until jump01 is held at root.
+	jump := sim.add_host(w, "jump01", sim.addr(10, 0, 4, 19), dmz, "Ubuntu 20.04")
+	sim.add_service(w, jump, {port = 22, proto = .TCP, name = "ssh", product = "OpenSSH", version = "8.2p1"})
+
+	// The reused password. `svc` exists on several boxes with the same
+	// password, which is the entire lateral-movement mechanic and needs no
+	// special case anywhere: ssh just compares strings.
+	SVC_PASSWORD :: "Nw-deploy-2019!"
+
+	sim.add_account(w, web, {username = "svc", password = SVC_PASSWORD})
+	sim.add_account(w, jump, {username = "svc", password = SVC_PASSWORD, is_admin = true})
+
+	// The way in.
+	//
+	// The index page carries a leftover developer comment naming a file that
+	// should never have been in the document root -- and that file is the
+	// deployment .env. Both halves of this are among the most common real
+	// findings there are, and together they make the entry point *discoverable*
+	// rather than guessable: curl the site, read the source, follow the path.
+	sim.add_file(
+		w,
+		web,
+		{
+			path = "/var/www/html/index.html",
+			content = "<html>\n<body>\n  <h1>Northwind Logistics</h1>\n  <p>Consignment tracking portal.</p>\n  <!-- TODO(deploy): stop shipping .env into the web root -->\n</body>\n</html>",
+		},
+	)
+	sim.add_file(
+		w,
+		web,
+		{
+			path = "/var/www/html/.env",
+			content = "# deployment credentials -- do not commit\nDEPLOY_USER=svc\nDEPLOY_PASS=Nw-deploy-2019!\nDEPLOY_TARGET=jump01.northwind.internal",
+			sensitive = true,
+		},
+		{{username = "svc", password = SVC_PASSWORD}},
+	)
+
+	sim.add_file(w, web, {path = "/etc/apache2/apache2.conf", content = "ServerName web01.northwind.internal\nListen 80\nListen 443"})
+	// Confirms the pivot target once you have a shell here, for a player who
+	// took the credential and did not stop to look around.
+	sim.add_file(w, web, {path = "/home/svc/.bash_history", content = "ssh svc@jump01\nsudo systemctl restart nginx"})
+
+	// --- CORP, behind the pivot --------------------------------------------
+
+	fs := sim.add_host(w, "fs01", sim.addr(10, 0, 9, 10), corp, "Windows Server 2016")
+	sim.add_service(w, fs, {port = 22, proto = .TCP, name = "ssh", product = "OpenSSH", version = "7.9"})
+	sim.add_service(w, fs, {port = 445, proto = .TCP, name = "smb", product = "Samba", version = "4.5.9"})
+	sim.add_account(w, fs, {username = "svc", password = SVC_PASSWORD})
+
+	sim.add_file(
+		w,
+		fs,
+		{
+			path = "/srv/backup/manifest.sql",
+			content = "-- northwind logistics :: consignment manifest\n-- 2026-07 export\nINSERT INTO consignments VALUES (88412,'ROTTERDAM','SEALED');\nINSERT INTO consignments VALUES (88413,'FELIXSTOWE','SEALED');\n-- [objective recovered]",
+			sensitive = true,
+		},
+	)
+	sim.add_file(w, fs, {path = "/srv/backup/README", content = "nightly dumps land here at 0200."})
+
+	// --- routing ------------------------------------------------------------
+
+	// The VPS has a route into the DMZ; that is what the contract bought.
+	append(&w.links, sim.Link{from = wan, to = dmz, via = origin, min_access = .User})
+	// CORP is reachable only through jump01, and only with root on it.
 	append(&w.links, sim.Link{from = dmz, to = corp, via = jump, min_access = .Root})
 
-	// Scripted reveal. Every line and every discovery is a scheduled timer, so
-	// the pacing you see is the sim's tick loop driving it, not a render-side
-	// animation.
-	t := sim.seconds(0.4)
-	step :: proc(t: ^sim.Tick, by: f64) -> sim.Tick {
-		t^ += sim.seconds(by)
-		return t^
-	}
-
-	sim.log_at(w, t, "ceph.sec bootstrap", .Info)
-	sim.log_at(w, step(&t, 0.5), "  arena ....... ok", .Info)
-	sim.log_at(w, step(&t, 0.25), "  scheduler ... ok  60 Hz fixed", .Info)
-	sim.log_at(w, step(&t, 0.25), "  prng ........ ok  pcg32", .Info)
-	sim.log_at(w, step(&t, 0.25), "  display ..... ok  crt composite", .Info)
-	sim.log_at(w, step(&t, 0.6), "", .Info)
-	sim.log_at(w, step(&t, 0.2), "operator@ceph:~$ nmap -sV 10.0.4.0/24", .Cmd)
-	sim.log_at(w, step(&t, 0.9), "Starting Nmap 7.94 ( simulated )", .Plain)
-
-	reveal(w, &t, gw, {0})
-	reveal(w, &t, web, {0, 1})
-	reveal(w, &t, jump, {0})
-
-	sim.log_at(w, step(&t, 0.8), "Nmap done: 254 addresses, 3 hosts up", .Plain)
-	sim.log_at(w, step(&t, 0.9), "", .Plain)
-	sim.log_at(w, step(&t, 0.1), "operator@ceph:~$ ssh operator@10.0.4.19", .Cmd)
-	sim.log_at(w, step(&t, 1.1), "  key accepted -- shell on jump01", .Good)
-
-	sim.schedule(w, step(&t, 0.3), sim.Act_Grant_Access{host = jump, level = .Root})
-	sim.log_at(w, step(&t, 0.9), "  route to CORP now viable via jump01", .Warn)
-	sim.log_at(w, step(&t, 1.2), "", .Plain)
-	sim.log_at(w, step(&t, 0.1), "-- milestone 0: engine foundation --", .Info)
-	sim.log_at(w, step(&t, 0.4), "sim, scheduler, events and crt pipeline are live.", .Info)
-	sim.log_at(w, step(&t, 0.3), "no command input yet -- that is milestone 1.", .Info)
-}
-
-// Schedules the discovery itself. The world stays undiscovered until the tick
-// arrives, so the session panel and the terminal always agree about what is
-// known -- which is exactly what scheduling actions instead of events buys.
-@(private)
-reveal :: proc(w: ^sim.World, t: ^sim.Tick, h: sim.Handle(sim.Host), service_indices: []int) {
-	t^ += sim.seconds(0.7)
-	sim.schedule(w, t^, sim.Act_Discover_Host{host = h})
-
-	for idx in service_indices {
-		t^ += sim.seconds(0.35)
-		sim.schedule(w, t^, sim.Act_Discover_Service{host = h, index = idx})
-	}
+	return origin
 }

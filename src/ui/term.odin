@@ -93,3 +93,74 @@ term_draw :: proc(t: ^Term, g: ^Grid, x, y, w, h: int, bg: Color_Id = .Bg_Panel)
 		row += 1
 	}
 }
+
+// The live input line: prompt, buffer, and a block cursor sitting on the
+// character it would overwrite.
+//
+// Scrolls horizontally to keep the cursor visible, because a long `nmap`
+// invocation is easily wider than the pane and a cursor you cannot see is
+// worse than truncated text.
+term_draw_input :: proc(
+	g: ^Grid,
+	x, y, w: int,
+	prompt: string,
+	text: string,
+	cursor: int,
+	busy: bool,
+	blink_on: bool,
+	bg: Color_Id = .Bg_Panel,
+) {
+	if w <= 0 {
+		return
+	}
+	grid_fill(g, x, y, w, 1, ' ', .Text, bg)
+
+	// A busy terminal shows the prompt dimmed and no cursor: the shell is not
+	// listening, and the display should say so rather than invite typing.
+	prompt_color: Color_Id = busy ? .Dim : .Good
+	end := grid_write(g, x, y, prompt, prompt_color, bg, busy ? {} : Attrs{.Bold})
+
+	if busy {
+		return
+	}
+
+	avail := w - (end - x)
+	if avail <= 0 {
+		return
+	}
+
+	// Slide the window so the cursor stays inside it, keeping a little context
+	// to the left once we have scrolled.
+	runes := make([dynamic]rune, 0, len(text), context.temp_allocator)
+	for ch in text {
+		append(&runes, ch)
+	}
+
+	start := 0
+	if cursor >= avail {
+		start = cursor - avail + 1
+	}
+
+	col := end
+	for i in start ..< len(runes) {
+		if col >= x + w {
+			break
+		}
+		on_cursor := i == cursor
+		grid_set(
+			g,
+			col,
+			y,
+			runes[i],
+			on_cursor && blink_on ? bg : .Bright,
+			on_cursor && blink_on ? .Cursor : bg,
+		)
+		col += 1
+	}
+
+	// Cursor past the last character: draw it as a solid block on the empty
+	// cell, which is where the next keystroke lands.
+	if cursor >= len(runes) && col < x + w && blink_on {
+		grid_set(g, col, y, ' ', bg, .Cursor)
+	}
+}

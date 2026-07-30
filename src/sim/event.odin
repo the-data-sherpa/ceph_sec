@@ -16,12 +16,14 @@ package sim
 // Semantic, not visual. The sim says what a line *means*; the frontend decides
 // what that looks like, which is what lets themes reskin everything at once.
 Log_Level :: enum u8 {
-	Plain, // ordinary tool output
-	Info,  // system notice, background detail
-	Cmd,   // a command the operator issued, echoed back
-	Good,  // something worked
-	Warn,  // getting noisy
-	Bad,   // something failed, or you were noticed
+	Plain,   // ordinary tool output
+	Info,    // system notice, background detail
+	Cmd,     // a command the operator issued, echoed back
+	Heading, // a finding worth the eye stopping on: a host, a section title
+	Data,    // structured detail under a heading: ports, versions, fields
+	Good,    // something worked
+	Warn,    // getting noisy
+	Bad,     // something failed, or you were noticed
 }
 
 Ev_Log :: struct {
@@ -43,11 +45,16 @@ Ev_Access_Gained :: struct {
 	level: Access,
 }
 
+Ev_Cred_Obtained :: struct {
+	index: int, // into World.keyring
+}
+
 Event :: union {
 	Ev_Log,
 	Ev_Host_Discovered,
 	Ev_Service_Discovered,
 	Ev_Access_Gained,
+	Ev_Cred_Obtained,
 }
 
 EVENT_RING_CAP :: 1024
