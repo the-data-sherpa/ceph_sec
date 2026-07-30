@@ -53,11 +53,11 @@ COMMANDS := []Command_Spec {
 	{name = "hostname", offline = true, category = .Builtin, usage = "hostname", summary = "print the current host", run = cmd_hostname},
 	{name = "id", offline = true, category = .Builtin, usage = "id", summary = "show user and access level", run = cmd_id},
 	{name = "creds", offline = true, category = .Builtin, usage = "creds", summary = "list credentials you hold", run = cmd_creds},
+	{name = "trace", offline = true, category = .Builtin, usage = "trace", summary = "show attention you have drawn", run = cmd_trace},
 	{name = "exit", offline = true, category = .Builtin, usage = "exit", summary = "leave the current shell", run = cmd_exit},
 
 	{name = "jobs", category = .Jobs, usage = "jobs", summary = "list running jobs", offline = true, run = cmd_jobs},
 	{name = "fg", category = .Jobs, usage = "fg [%n]", summary = "bring a job to the foreground", offline = true, run = cmd_fg},
-	{name = "trace", offline = true, category = .Jobs, usage = "trace", summary = "show attention drawn per segment", run = cmd_trace},
 	{name = "kill", category = .Jobs, usage = "kill [%n]", summary = "stop a running job", offline = true, run = cmd_kill},
 
 	{name = "pwd", offline = true, category = .Filesystem, usage = "pwd", summary = "print the working directory", run = cmd_pwd},
@@ -68,8 +68,8 @@ COMMANDS := []Command_Spec {
 	{
 		name = "nmap",
 		category = .Recon,
-		usage = "nmap [-sn|-sV] <target>",
-		summary = "scan for live hosts and services",
+		usage = "nmap [-sn|-sV] [-T2] <t>",
+		summary = "find live hosts and services",
 		value_flags = {"p"},
 		job = true,
 		backgroundable = true,
@@ -90,7 +90,7 @@ COMMANDS := []Command_Spec {
 		name = "ssh",
 		category = .Access,
 		usage = "ssh <user@host>",
-		summary = "log in with a credential you hold",
+		summary = "log in with a held credential",
 		value_flags = {"p"},
 		job = true,
 		run = cmd_ssh,

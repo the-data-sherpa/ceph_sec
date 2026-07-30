@@ -623,11 +623,157 @@ test_losing_a_host_evicts_the_prompt :: proc(t: ^testing.T) {
 	transcript(&f)
 
 	sim.revoke_access(&f.w, f.web, .None)
+
+	// revoke_access is a mutator in the grant_access mould: it changes the world
+	// and emits its own event, so the two cannot drift. The frontend does not
+	// render this one -- the hunt and the alert narrate their own actions -- but
+	// it is the record a net map will read, and it must carry what was lost.
+	lost := 0
+	for {
+		e, ok := sim.ring_pop(&f.w.events)
+		if !ok {
+			break
+		}
+		if ev, is_lost := e.(sim.Ev_Access_Lost); is_lost {
+			lost += 1
+			testing.expect_value(t, ev.host, f.web)
+			testing.expect_value(t, ev.was, sim.Access.User)
+		}
+	}
+	testing.expect_value(t, lost, 1)
+
+	// Revoking again is a no-op: access only ever moves down to a level it is
+	// not already at, mirroring grant_access only ever ratcheting up.
+	sim.revoke_access(&f.w, f.web, .None)
 	shell.session_update(&f.sess)
 
-	testing.expect(t, strings.contains(transcript(&f), "closed by remote host"))
+	again := 0
+	saw_eviction := false
+	for {
+		e, ok := sim.ring_pop(&f.w.events)
+		if !ok {
+			break
+		}
+		#partial switch ev in e {
+		case sim.Ev_Access_Lost:
+			again += 1
+		case sim.Ev_Log:
+			if strings.contains(ev.text, "closed by remote host") {
+				saw_eviction = true
+			}
+		}
+	}
+	testing.expect_value(t, again, 0)
+	testing.expect(t, saw_eviction, "the player should be told why the prompt moved")
+
 	testing.expect_value(t, f.sess.host, f.origin)
 	testing.expect_value(t, f.sess.user, "operator")
+}
+
+// --- reset and determinism --------------------------------------------------
+
+// A field added to World and forgotten in world_bind holds a stale arena
+// pointer across a reset -- a use-after-free that would surface as corruption
+// on the *second* run, which is close to undiagnosable from the symptom. This
+// asserts every piece of M2 state, not just the ones that were easy to reach.
+@(test)
+test_world_reset_clears_all_trace_state :: proc(t: ^testing.T) {
+	f: Fixture
+	fixture(&f)
+	defer fixture_destroy(&f)
+
+	// Make every one of them non-zero.
+	run(&f, "nmap -sV 10.0.4.0/24")
+	pin_segment(&f, f.dmz, sim.SUSPICION_ALARM + 3000)
+	sim.tick_n(&f.w, 300)
+	sim.trace_advance(&f.w, sim.TRACE_HUNT)
+	sim.end_run(&f.w, .Caught)
+
+	testing.expect(t, f.w.trace.level > 0)
+	testing.expect(t, f.w.noise_log.count > 0)
+	testing.expect(t, f.w.hunt_tag != 0)
+	testing.expect(t, f.w.trace.responses != {})
+
+	sim.world_reset(&f.w, 99)
+
+	testing.expect_value(t, f.w.trace.level, i32(0))
+	testing.expect_value(t, f.w.trace.accum, i64(0))
+	testing.expect_value(t, f.w.trace.responses, bit_set[sim.Trace_Stage]{})
+	testing.expect_value(t, f.w.hunt_tag, u32(0))
+	testing.expect_value(t, f.w.noise_log.count, 0)
+	testing.expect_value(t, f.w.noise_log.head, 0)
+	testing.expect_value(t, f.w.run.state, sim.Run_State.Running)
+	testing.expect_value(t, f.w.run.ended_at, sim.Tick(0))
+	testing.expect_value(t, len(f.w.due), 0)
+	testing.expect_value(t, len(f.w.timers), 0)
+	testing.expect_value(t, f.w.tag_counter, u32(0))
+	testing.expect_value(t, sim.pool_len(&f.w.subnets), 0) // segments go with the arena
+}
+
+// Seed determinism, extended through the whole trace system. Two worlds given
+// the same seed and the same commands must agree on every number, including
+// after all four defender responses have fired.
+@(test)
+test_same_seed_reproduces_trace_and_responses :: proc(t: ^testing.T) {
+	drive :: proc(f: ^Fixture) {
+		run(f, "nmap -sn 10.0.4.0/24")
+		for _ in 0 ..< 20 {
+			if sim.run_over(&f.w) {
+				break
+			}
+			run(f, "ssh root@10.0.4.11")
+		}
+		for _ in 0 ..< 60 * 60 * 6 {
+			if sim.run_over(&f.w) {
+				break
+			}
+			sim.tick(&f.w)
+			shell.session_update(&f.sess)
+		}
+	}
+
+	a, b: Fixture
+	fixture(&a)
+	fixture(&b)
+	defer fixture_destroy(&a)
+	defer fixture_destroy(&b)
+
+	drive(&a)
+	drive(&b)
+
+	testing.expect_value(t, a.w.run.state, b.w.run.state)
+	testing.expect_value(t, a.w.run.ended_at, b.w.run.ended_at)
+	testing.expect_value(t, a.w.trace.level, b.w.trace.level)
+	testing.expect_value(t, a.w.trace.accum, b.w.trace.accum)
+	testing.expect_value(t, a.w.trace.responses, b.w.trace.responses)
+	testing.expect_value(t, a.w.now, b.w.now)
+	testing.expect_value(t, a.w.tag_counter, b.w.tag_counter)
+	testing.expect_value(t, a.w.noise_log.count, b.w.noise_log.count)
+
+	ita, itb: int
+	for {
+		sa, ha, oka := sim.pool_iter(&a.w.subnets, &ita)
+		sb, hb, okb := sim.pool_iter(&b.w.subnets, &itb)
+		if !oka || !okb {
+			testing.expect_value(t, oka, okb)
+			break
+		}
+		testing.expect_value(t, ha, hb)
+		testing.expect_value(t, sa.suspicion, sb.suspicion)
+		testing.expect_value(t, sa.hot_ticks, sb.hot_ticks)
+		testing.expect_value(t, sa.monitoring, sb.monitoring)
+		testing.expect_value(t, sa.alarmed, sb.alarmed)
+	}
+
+	// The defender responses consume no randomness, so the generator's stream is
+	// independent of how the player played. That is what keeps a seed a
+	// description of the *world* rather than of the session -- and it means a
+	// future replay feature needs no input log.
+	quiet: Fixture
+	fixture(&quiet)
+	defer fixture_destroy(&quiet)
+	testing.expect_value(t, a.w.rng, quiet.w.rng)
+	testing.expect(t, a.w.trace.responses != {}, "the driven run should have escalated")
 }
 
 // --- acceptance -------------------------------------------------------------

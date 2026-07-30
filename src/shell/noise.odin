@@ -82,28 +82,6 @@ touched :: proc(s: ^Session, h: sim.Handle(sim.Host), units: int) {
 	s.charge_count += 1
 }
 
-// Files a charge against a segment directly, for tools that reason about a
-// range rather than a specific host.
-touched_subnet :: proc(s: ^Session, sn: sim.Handle(sim.Subnet), units: int) {
-	if units <= 0 {
-		return
-	}
-	for i in 0 ..< s.charge_count {
-		if s.charges[i].subnet == sn {
-			s.charges[i].units = max(s.charges[i].units, units)
-			return
-		}
-	}
-	if s.charge_count >= CHARGES_MAX {
-		return
-	}
-	s.charges[s.charge_count] = Charge {
-		subnet = sn,
-		units  = units,
-	}
-	s.charge_count += 1
-}
-
 // Converts the slips filed during a dispatch into sim charges, and clears them.
 // Called by session_exec once the tool has returned.
 drain_charges :: proc(s: ^Session, source: string) {

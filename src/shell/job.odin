@@ -38,10 +38,9 @@ Job :: struct {
 	ends_at:    sim.Tick,
 
 	// Captured at dispatch and never re-read from the Session. A scan launched
-	// on web01 must not silently retarget when the prompt moves to jump01.
+	// on web01 must not silently retarget when the prompt moves to jump01, and
+	// it is what the orphan sweep checks when a foothold is taken away.
 	host: sim.Handle(sim.Host),
-	user: string,
-	cwd:  string,
 
 	// Owned by the job rather than the session. With several jobs live there is
 	// no quiescent moment for a single shared Maybe(Move) to land in, and a
@@ -269,7 +268,5 @@ job_capture :: proc(s: ^Session, j: ^Job, raw: string, background: bool) {
 	// allocated and would look fine in every test.
 	j.raw = strings.clone(raw, w.allocator)
 	j.host = s.host
-	j.user = strings.clone(s.user, w.allocator)
-	j.cwd = strings.clone(s.cwd, w.allocator)
 	j.pending_move = nil
 }

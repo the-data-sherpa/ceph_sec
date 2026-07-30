@@ -17,6 +17,12 @@ cmd_help :: proc(s: ^Session, cmd: ^Command) {
 		}
 		out(s, spec.usage, .Heading)
 		out(s, fmt.tprintf("    %s", spec.summary))
+		if spec.job && !spec.offline {
+			out(s, "    costs attention in the segment it reaches", .Warn)
+		}
+		if spec.backgroundable {
+			out(s, "    may be backgrounded with &", .Info)
+		}
 		return
 	}
 
@@ -27,10 +33,21 @@ cmd_help :: proc(s: ^Session, cmd: ^Command) {
 			current = spec.category
 			out(s, fmt.tprintf("  [%s]", category_label(current)), .Info)
 		}
-		out(s, fmt.tprintf("    %-24s %s", spec.usage, spec.summary))
+		// Which commands cost attention is now the most important thing about
+		// them, so it belongs in the listing rather than in a doc nobody opens.
+		out(s, fmt.tprintf("  %s %-27s %s", noise_marker(spec), spec.usage, spec.summary))
 	}
 	out(s, "", .Plain)
-	out(s, "^C interrupts a running command.", .Info)
+	out(s, "! costs attention -- run `trace` to see how much.", .Info)
+	out(s, "& backgrounds a command; ^C interrupts the foreground one.", .Info)
+}
+
+// A command either reaches across the network and is charged for it, or it does
+// not. `offline` is declared on the spec and asserted against by the test suite,
+// so this marker cannot drift from what actually happens.
+@(private)
+noise_marker :: proc(spec: Command_Spec) -> string {
+	return spec.job && !spec.offline ? "!" : " "
 }
 
 cmd_clear :: proc(s: ^Session, cmd: ^Command) {
