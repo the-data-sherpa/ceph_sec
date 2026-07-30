@@ -2,6 +2,7 @@ package shell
 
 import "core:fmt"
 import "core:strings"
+import "../campaign"
 import "../input"
 import "../sim"
 
@@ -34,6 +35,28 @@ Session :: struct {
 	charge_count: int,
 
 	hinted_kill: bool, // the one-shot "killing does not refund noise" note
+
+	// Campaign context. Both point at storage `main` owns for the whole
+	// program, not into the run arena -- they must survive world_reset, which
+	// is exactly what the level transition does.
+	level:    ^campaign.Level,
+	progress: ^campaign.Progress,
+
+	// Which tools this level makes available. Narrower than what the player has
+	// unlocked: a level can withhold something you own.
+	tools: []string,
+
+	// A level change the shell has asked for and cannot perform itself. The
+	// transition frees the arena this session's own strings live in, so `main`
+	// carries it out between frames. Same shape as a job's pending move.
+	pending_transition: Maybe(Transition),
+}
+
+// A requested level change. `retry` distinguishes restarting the current level
+// from moving to another, which only matters for what gets said about it.
+Transition :: struct {
+	level: int,
+	retry: bool,
 }
 
 Move :: struct {
@@ -306,6 +329,13 @@ session_exec :: proc(s: ^Session, text: string) {
 	spec, found := lookup(tokens[0])
 	if !found {
 		out(s, fmt.tprintf("%s: command not found", tokens[0]), .Bad)
+		return
+	}
+
+	// Checked before parsing, so a locked tool cannot charge noise, mint a tag
+	// or occupy a slot on its way to being refused.
+	if !tool_available(s, spec) {
+		out(s, fmt.tprintf("%s: %s", spec.name, unavailable_reason(s, spec)), .Bad)
 		return
 	}
 

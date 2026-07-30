@@ -8,6 +8,7 @@ package shell
 // the failure mode where documented flags no longer exist cannot happen.
 
 Category :: enum u8 {
+	Campaign,
 	Builtin,
 	Filesystem,
 	Jobs,
@@ -46,6 +47,12 @@ Command_Spec :: struct {
 // Ordered for `help`: what you stand on, then what you look with, then what you
 // move with.
 COMMANDS := []Command_Spec {
+	{name = "levels", offline = true, category = .Campaign, usage = "levels", summary = "list the campaign", run = cmd_levels},
+	{name = "play", offline = true, category = .Campaign, usage = "play [n]", summary = "start a level", run = cmd_play},
+	{name = "retry", offline = true, category = .Campaign, usage = "retry", summary = "restart this level", run = cmd_retry},
+	{name = "objectives", offline = true, category = .Campaign, usage = "objectives", summary = "show this level's goals", run = cmd_objectives},
+	{name = "techniques", offline = true, category = .Campaign, usage = "techniques", summary = "show ATT&CK coverage", run = cmd_techniques},
+
 	{name = "help", offline = true, category = .Builtin, usage = "help [command]", summary = "list commands, or explain one", run = cmd_help},
 	{name = "clear", offline = true, category = .Builtin, usage = "clear", summary = "clear the terminal", run = cmd_clear},
 	{name = "history", offline = true, category = .Builtin, usage = "history", summary = "show recent commands", run = cmd_history},
@@ -110,6 +117,8 @@ category_label :: proc(c: Category) -> string {
 	switch c {
 	case .Builtin:
 		return "shell"
+	case .Campaign:
+		return "campaign"
 	case .Filesystem:
 		return "files"
 	case .Jobs:

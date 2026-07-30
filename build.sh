@@ -45,9 +45,10 @@ fi
 # `shell` matters even more than `sim` here: it is where the commands named
 # nmap and ssh live, and therefore the one place where someone -- a
 # contributor, a future me, a model -- might be tempted to make one of them
-# real. A build failure is a better guard than a code review, because the cost
+# real. `campaign` is level content, which must be as incapable of reaching a
+# network as the engine running it. A build failure is a better guard than a code review, because the cost
 # of noticing late is not a rewrite but a genuinely harmful program.
-PURE_PACKAGES="src/sim src/shell src/input"
+PURE_PACKAGES="src/sim src/shell src/input src/campaign"
 
 purity_gate() {
     local violations=0
@@ -90,6 +91,8 @@ do_check() {
     echo "  src/input ....... ok"
     "$ODIN" check src/sim -no-entry-point
     echo "  src/sim ......... ok"
+    "$ODIN" check src/campaign -no-entry-point
+    echo "  src/campaign .... ok"
     "$ODIN" check src/shell -no-entry-point
     echo "  src/shell ....... ok"
     "$ODIN" check src/ui -no-entry-point

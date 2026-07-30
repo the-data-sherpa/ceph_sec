@@ -2,6 +2,7 @@ package shell
 
 import "core:fmt"
 import "core:strings"
+import "../campaign"
 import "../sim"
 
 // Built-in commands. These are instant -- they represent things happening on a
@@ -28,17 +29,31 @@ cmd_help :: proc(s: ^Session, cmd: ^Command) {
 
 	out(s, "commands:", .Info)
 	current := Category(255)
+	locked := false
 	for spec in COMMANDS {
 		if spec.category != current {
 			current = spec.category
 			out(s, fmt.tprintf("  [%s]", category_label(current)), .Info)
 		}
+		// Locked tools are listed, not hidden. Seeing what is coming is part of
+		// the teaching -- a player who knows `ssh` exists two levels away
+		// understands the shape of the campaign; one who cannot see it just
+		// thinks the game is small.
+		if !tool_available(s, spec) {
+			locked = true
+			out(s, fmt.tprintf("  . %-27s %s", spec.usage, locked_note(s, spec)), .Info)
+			continue
+		}
+
 		// Which commands cost attention is now the most important thing about
 		// them, so it belongs in the listing rather than in a doc nobody opens.
 		out(s, fmt.tprintf("  %s %-27s %s", noise_marker(spec), spec.usage, spec.summary))
 	}
 	out(s, "", .Plain)
 	out(s, "! costs attention -- run `trace` to see how much.", .Info)
+	if locked {
+		out(s, ". locked -- an earlier level teaches it.", .Info)
+	}
 	out(s, "& backgrounds a command; ^C interrupts the foreground one.", .Info)
 }
 
@@ -48,6 +63,18 @@ cmd_help :: proc(s: ^Session, cmd: ^Command) {
 @(private)
 noise_marker :: proc(spec: Command_Spec) -> string {
 	return spec.job && !spec.offline ? "!" : " "
+}
+
+// What to say beside a tool the player cannot use here. Names the level that
+// teaches it where possible, so the listing doubles as a syllabus.
+@(private)
+locked_note :: proc(s: ^Session, spec: Command_Spec) -> string {
+	if l, ok := campaign.grants_tool(spec.name); ok {
+		if s.progress == nil || !campaign.is_complete(s.progress, l.id) {
+			return fmt.tprintf("level %d teaches this", l.number)
+		}
+	}
+	return "not available here"
 }
 
 cmd_clear :: proc(s: ^Session, cmd: ^Command) {

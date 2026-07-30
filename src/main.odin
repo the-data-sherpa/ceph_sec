@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:strconv"
 import "core:strings"
+import "campaign"
 import "input"
 import "shell"
 import "sim"
@@ -36,10 +37,11 @@ main :: proc() {
 	}
 	defer sim.world_destroy(&w)
 
-	origin := build_scenario(&w)
+	progress: campaign.Progress
+	campaign.progress_init(&progress)
+	defer campaign.progress_destroy(&progress)
 
 	sess: shell.Session
-	shell.session_init(&sess, &w, origin, "operator")
 
 	app: ui.App
 	ui.app_init(&app, "Ceph.Sec", GRID_W, GRID_H, "assets/shaders/crt.fs")
@@ -54,7 +56,12 @@ main :: proc() {
 	defer ui.input_destroy(&keys)
 
 	term: ui.Term
-	greeting(&w)
+
+	// Start on the first unfinished level. A menu would be a second UI mode for
+	// no gain -- `levels` and `play` are commands, and the console is the game.
+	first, _ := campaign.next_level(&progress)
+	start_level(&w, &sess, &term, &progress, first)
+
 	debriefed := false
 
 	// Commands queued by --exec, fed in one at a time as the shell frees up.
@@ -109,6 +116,22 @@ main :: proc() {
 
 		drain_events(&w, &term)
 
+		// Level completion is checked from world state rather than announced by
+		// a command, so it fires however the player got there -- including on a
+		// route the level's author did not anticipate.
+		//
+		// Held until everything has settled. The last objective often falls
+		// part-way through a tool's output -- the third host of a sweep is found
+		// before the sweep finishes printing -- and a debrief landing mid-scan
+		// reads as though the game interrupted itself.
+		settled := !shell.session_active(&sess) && len(w.timers) == 0
+		if settled && !debriefed && sess.level != nil && campaign.level_complete(&w, sess.level) {
+			debriefed = true
+			campaign.mark_complete(&progress, sess.level.id)
+			level_debrief(&w, sess.level, &progress, &term)
+			ui.term_scroll_to_bottom(&term)
+		}
+
 		// After draining, so the run's own final lines land above the summary.
 		if sim.run_over(&w) && !debriefed {
 			debriefed = true
@@ -116,15 +139,19 @@ main :: proc() {
 			ui.term_scroll_to_bottom(&term)
 		}
 
+		// The level change the shell asked for. Performed here because it frees
+		// the arena the session's own strings live in -- see start_level.
+		if t, wants := sess.pending_transition.?; wants {
+			sess.pending_transition = nil
+			if target, ok := campaign.level_by_number(t.level); ok {
+				start_level(&w, &sess, &term, &progress, target)
+				debriefed = false
+				continue
+			}
+		}
+
 		layout(&app, &w, &sess, &term)
 		ui.app_render(&app, f32(sim.tick_seconds(w.now)))
-
-		// Checked after draining and drawing, so a run's final output -- the
-		// debrief especially -- is never left sitting unread in the event ring.
-		// `exit` leaves at once; being caught or extracting holds the screen.
-		if w.run.state == .Quit {
-			break
-		}
 
 		if opts.shot.enabled && w.now >= opts.shot.at {
 			ui.app_capture(&app, opts.shot.path)
@@ -417,15 +444,19 @@ header :: proc(g: ^ui.Grid, w: ^sim.World, sess: ^shell.Session) {
 		ui.grid_write(g, 10, 0, fmt.tprintf("running %s ...", shell.foreground_label(sess)), .Warn, .Bg_Panel)
 	} else if jobs := shell.slots_in_use(sess); jobs > 0 {
 		ui.grid_write(g, 10, 0, fmt.tprintf("%d job%s running", jobs, jobs == 1 ? "" : "s"), .Accent, .Bg_Panel)
-	} else {
-		ui.grid_write(g, 10, 0, "milestone 2 -- jobs and trace", .Dim, .Bg_Panel)
+	} else if sess.level != nil {
+		ui.grid_write(g, 10, 0, fmt.tprintf("L%d  %s", sess.level.number, sess.level.title), .Dim, .Bg_Panel)
 	}
 
 	// Trace sits in the header rather than the panel: it is the run clock, and
-	// it should be visible without looking for it.
-	trace := fmt.tprintf("TRACE %5.1f%%", f32(w.trace.level) / 100)
-	trace_x := GRID_W - len(trace) - 15
-	ui.grid_write(g, trace_x, 0, trace, trace_color(w.trace.level), .Bg_Panel, w.trace.level > 0 ? Attrs_Bold : {})
+	// it should be visible without looking for it. On levels that have not
+	// taught it yet, showing a permanently-zero meter would only raise a
+	// question the level is not ready to answer.
+	if sess.level == nil || sess.level.trace {
+		trace := fmt.tprintf("TRACE %5.1f%%", f32(w.trace.level) / 100)
+		trace_x := GRID_W - len(trace) - 15
+		ui.grid_write(g, trace_x, 0, trace, trace_color(w.trace.level), .Bg_Panel, w.trace.level > 0 ? Attrs_Bold : {})
+	}
 
 	// Frozen once the run is over: the world keeps ticking so the debrief can
 	// finish drawing, but a clock still counting up past the end contradicts
@@ -444,6 +475,36 @@ session_panel :: proc(g: ^ui.Grid, w: ^sim.World, sess: ^shell.Session, x, y, wi
 		ui.grid_write(g, x + width - len(value), y, value, vc, .Bg_Panel)
 	}
 
+	// Objectives lead the panel. They are the thing the player is working
+	// against, and a checklist that ticks is what turns "poke at it" into
+	// "I know what I am trying to do".
+	if sess.level != nil {
+		met, required := campaign.objectives_met(w, sess.level)
+		ui.grid_write(g, x, row, "objectives", .Dim, .Bg_Panel)
+		count := fmt.tprintf("%d/%d", met, required)
+		ui.grid_write(g, x + width - len(count), row, count, met == required ? .Good : .Bright, .Bg_Panel)
+		row += 1
+
+		for o in sess.level.objectives {
+			if row >= GRID_H - 6 {
+				break
+			}
+			done := campaign.objective_met(w, o)
+			ui.grid_write(g, x, row, done ? "[x]" : "[ ]", done ? .Good : .Dim, .Bg_Panel)
+
+			// Trimmed rather than wrapped: an objective is a label, and one
+			// spilling onto a second line would push the rest off the panel.
+			text := o.text
+			limit := width - 4
+            if len(text) > limit {
+				text = text[:limit]
+			}
+			ui.grid_write(g, x + 4, row, text, done ? .Good : (o.optional ? .Dim : .Text), .Bg_Panel)
+			row += 1
+		}
+		row += 1
+	}
+
 	if h, ok := sim.pool_get(&w.hosts, sess.host); ok {
 		buf: [15]u8
 		ui.grid_write(g, x, row, "shell on", .Dim, .Bg_Panel)
@@ -456,14 +517,10 @@ session_panel :: proc(g: ^ui.Grid, w: ^sim.World, sess: ^shell.Session, x, y, wi
 		row += 2
 	}
 
-	discovered, services, owned := survey(w)
-	ui.grid_write(g, x, row, "recon", .Dim, .Bg_Panel)
+	discovered, _, owned := survey(w)
+	field(g, x, row, width, "hosts seen", fmt.tprintf("%d", discovered))
 	row += 1
-	field(g, x, row, width, " hosts seen", fmt.tprintf("%d", discovered))
-	row += 1
-	field(g, x, row, width, " services", fmt.tprintf("%d", services))
-	row += 1
-	field(g, x, row, width, " footholds", fmt.tprintf("%d", owned), owned > 1 ? .Good : .Bright)
+	field(g, x, row, width, "footholds", fmt.tprintf("%d", owned), owned > 1 ? .Good : .Bright)
 	row += 2
 
 	// Jobs, when there are any. Costs a line only while it is telling you
@@ -503,6 +560,10 @@ session_panel :: proc(g: ^ui.Grid, w: ^sim.World, sess: ^shell.Session, x, y, wi
 	// Segments, each with its own suspicion bar. This is where the player
 	// learns the causal link between a noisy action and the consequence, so it
 	// has to sit next to the terminal rather than behind a command.
+	if sess.level != nil && !sess.level.trace {
+		return // nothing is watching, so there is nothing to report
+	}
+
 	ui.grid_write(g, x, row, "segments", .Dim, .Bg_Panel)
 	row += 1
 	it: int
@@ -613,128 +674,125 @@ footer :: proc(g: ^ui.Grid, app: ^ui.App, term: ^ui.Term, dropped: u64) {
 		ui.grid_write(g, GRID_W - len(tag) - 1, y, tag, .Bad, .Bg_Panel)
 	}
 }
+// --- levels -----------------------------------------------------------------
 
-// --- scenario ---------------------------------------------------------------
+// Starting or restarting a level, and the one place it may happen.
+//
+// The order below is not stylistic. `ui.Term` stores string *references* into
+// the run arena (a deliberate M0 choice -- sim log text outlives the
+// scrollback, so copying would be waste), and Session.user/cwd/line.history are
+// arena-allocated too. sim.world_reset frees that arena. So every holder of an
+// arena pointer must be emptied *before* the reset, and rebound after it.
+//
+// Doing this from inside a shell command would free the session mid-dispatch,
+// which is why commands only record the intent and this runs between frames.
+start_level :: proc(
+	w: ^sim.World,
+	sess: ^shell.Session,
+	term: ^ui.Term,
+	progress: ^campaign.Progress,
+	level: ^campaign.Level,
+) {
+	ui.term_clear(term) // drop every dangling reference first
+	sim.world_reset(w, SEED)
 
-greeting :: proc(w: ^sim.World) {
-	sim.log_line(w, "ceph.sec // operator console", .Info)
+	origin := level.build(w)
+	shell.session_init(sess, w, origin, "operator")
+
+	sess.level = level
+	sess.progress = progress
+	sess.tools = level.tools
+	sess.slots = level.slots if level.slots > 0 else shell.SLOTS_DEFAULT
+	progress.current = level.id
+
+	// Trace is per-level: the early levels teach one idea at a time, and a
+	// beginner meeting a rising detection meter in level one learns neither.
+	// Disabling it means leaving every segment unwatched, which is the same
+	// mechanism as the player's own VPS being free.
+	if !level.trace {
+		it: int
+		for sn in sim.pool_iter(&w.subnets, &it) {
+			sn.monitoring = .None
+		}
+	}
+
+	brief(w, level)
+}
+
+brief :: proc(w: ^sim.World, level: ^campaign.Level) {
+	sim.log_line(w, fmt.aprintf("LEVEL %d  --  %s", level.number, level.title, allocator = w.allocator), .Heading)
+
+	for tech in level.techniques {
+		sim.log_line(
+			w,
+			fmt.aprintf("ATT&CK  %s  %s", tech.id, tech.name, allocator = w.allocator),
+			.Info,
+		)
+	}
+	if len(level.techniques) > 0 {
+		sim.log_line(
+			w,
+			fmt.aprintf("tactic  %s", campaign.tactic_name(level.techniques[0].tactic), allocator = w.allocator),
+			.Info,
+		)
+	}
+
 	sim.log_line(w, "", .Plain)
-	sim.log_line(w, "CONTRACT: NORTHWIND LOGISTICS", .Heading)
-	sim.log_line(w, "Recover /srv/backup/manifest.sql from their file server.", .Plain)
-	sim.log_line(w, "You have root on a rented VPS with a route into their DMZ.", .Plain)
+	for line in level.brief {
+		sim.log_line(w, line, .Plain)
+	}
 	sim.log_line(w, "", .Plain)
-	sim.log_line(w, "`help` lists what you can run. Start by finding out what is there.", .Info)
+	sim.log_line(w, "`objectives` to see your goals, `help` for what you can run.", .Info)
 	sim.log_line(w, "", .Plain)
 }
 
-// The M1 network.
-//
-// The intended path is meant to be *discoverable* rather than guessable:
-// scanning the DMZ finds web01, whose deployment config leaks a service account
-// password. That password is reused on jump01 -- the box bridging into CORP --
-// and jump01's svc account is an admin, so taking it opens the route to the
-// objective. Every step is visible from the step before it.
-build_scenario :: proc(w: ^sim.World) -> sim.Handle(sim.Host) {
-	// Monitoring runs inversely to how interesting a segment is, which is the
-	// recurring shape of the whole game: the boxes that are easy to be loud
-	// around are the ones not worth reaching.
-	wan := sim.add_subnet(w, "WAN", sim.addr(198, 51, 100, 0), 24, .None)
-	dmz := sim.add_subnet(w, "DMZ", sim.addr(10, 0, 4, 0), 24, .Low)
-	corp := sim.add_subnet(w, "CORP", sim.addr(10, 0, 9, 0), 24, .Medium)
+// Said once, when the last required objective falls. The teaching payload: the
+// player has just done the thing, and now finds out what it is called and how
+// it is stopped.
+level_debrief :: proc(w: ^sim.World, level: ^campaign.Level, progress: ^campaign.Progress, term: ^ui.Term) {
+	push :: proc(w: ^sim.World, term: ^ui.Term, text: string, colour: ui.Color_Id) {
+		ui.term_push(term, fmt.aprintf("%s", text, allocator = w.allocator), colour)
+	}
 
-	// The operator's own box. Held at root from the start; it is the thing the
-	// player stands on rather than a target.
-	origin := sim.add_host(w, "ceph", sim.addr(198, 51, 100, 7), wan, "Debian 12")
-	sim.grant_access(w, origin, .Root)
-	w.origin = origin
+	push(w, term, "", .Text)
+	push(w, term, fmt.aprintf("== LEVEL %d COMPLETE ==", level.number, allocator = w.allocator), .Good)
 
-	sim.add_file(
-		w,
-		origin,
-		{
-			path = "/root/contract.txt",
-			content = "NORTHWIND LOGISTICS -- retrieval\n\ntarget:   /srv/backup/manifest.sql\nnetwork:  10.0.4.0/24 is routable from this host\nnote:     10.0.9.0/24 is not directly routable.\n          find something that bridges the two.\n\nno credentials supplied. start with what they expose.",
-		},
-	)
-	sim.add_file(w, origin, {path = "/root/.ssh/known_hosts", content = "# nothing here yet"})
+	optional_done, optional_total := 0, 0
+	for o in level.objectives {
+		if !o.optional {
+			continue
+		}
+		optional_total += 1
+		if campaign.objective_met(w, o) {
+			optional_done += 1
+		}
+	}
+	if optional_total > 0 {
+		push(
+			w,
+			term,
+			fmt.aprintf("optional objectives: %d of %d", optional_done, optional_total, allocator = w.allocator),
+			optional_done == optional_total ? .Good : .Dim,
+		)
+	}
 
-	// --- DMZ ---------------------------------------------------------------
+	sections := [3]struct {
+		heading: string,
+		body:    []string,
+	}{{"WHAT YOU JUST DID", level.debrief.what}, {"WHY IT WORKS", level.debrief.why}, {"HOW IT IS STOPPED", level.debrief.defence}}
 
-	gw := sim.add_host(w, "gw-edge", sim.addr(10, 0, 4, 1), dmz, "VyOS 1.2")
-	sim.add_service(w, gw, {port = 22, proto = .TCP, name = "ssh", product = "OpenSSH", version = "7.4"})
+	for section in sections {
+		push(w, term, "", .Text)
+		push(w, term, section.heading, .Bright)
+		for line in section.body {
+			push(w, term, line, len(line) == 0 ? .Text : .Text)
+		}
+	}
 
-	web := sim.add_host(w, "web01", sim.addr(10, 0, 4, 11), dmz, "Ubuntu 18.04")
-	sim.add_service(w, web, {port = 22, proto = .TCP, name = "ssh", product = "OpenSSH", version = "7.6p1"})
-	sim.add_service(w, web, {port = 80, proto = .TCP, name = "http", product = "Apache httpd", version = "2.4.29"})
-	sim.add_service(w, web, {port = 443, proto = .TCP, name = "https", product = "Apache httpd", version = "2.4.29"})
-
-	jump := sim.add_host(w, "jump01", sim.addr(10, 0, 4, 19), dmz, "Ubuntu 20.04")
-	sim.add_service(w, jump, {port = 22, proto = .TCP, name = "ssh", product = "OpenSSH", version = "8.2p1"})
-
-	// The reused password. `svc` exists on several boxes with the same
-	// password, which is the entire lateral-movement mechanic and needs no
-	// special case anywhere: ssh just compares strings.
-	SVC_PASSWORD :: "Nw-deploy-2019!"
-
-	sim.add_account(w, web, {username = "svc", password = SVC_PASSWORD})
-	sim.add_account(w, jump, {username = "svc", password = SVC_PASSWORD, is_admin = true})
-
-	// The way in.
-	//
-	// The index page carries a leftover developer comment naming a file that
-	// should never have been in the document root -- and that file is the
-	// deployment .env. Both halves of this are among the most common real
-	// findings there are, and together they make the entry point *discoverable*
-	// rather than guessable: curl the site, read the source, follow the path.
-	sim.add_file(
-		w,
-		web,
-		{
-			path = "/var/www/html/index.html",
-			content = "<html>\n<body>\n  <h1>Northwind Logistics</h1>\n  <p>Consignment tracking portal.</p>\n  <!-- TODO(deploy): stop shipping .env into the web root -->\n</body>\n</html>",
-		},
-	)
-	sim.add_file(
-		w,
-		web,
-		{
-			path = "/var/www/html/.env",
-			content = "# deployment credentials -- do not commit\nDEPLOY_USER=svc\nDEPLOY_PASS=Nw-deploy-2019!\nDEPLOY_TARGET=jump01.northwind.internal",
-			sensitive = true,
-		},
-		{{username = "svc", password = SVC_PASSWORD}},
-	)
-
-	sim.add_file(w, web, {path = "/etc/apache2/apache2.conf", content = "ServerName web01.northwind.internal\nListen 80\nListen 443"})
-	// Confirms the pivot target once you have a shell here, for a player who
-	// took the credential and did not stop to look around.
-	sim.add_file(w, web, {path = "/home/svc/.bash_history", content = "ssh svc@jump01\nsudo systemctl restart nginx"})
-
-	// --- CORP, behind the pivot --------------------------------------------
-
-	fs := sim.add_host(w, "fs01", sim.addr(10, 0, 9, 10), corp, "Windows Server 2016")
-	sim.add_service(w, fs, {port = 22, proto = .TCP, name = "ssh", product = "OpenSSH", version = "7.9"})
-	sim.add_service(w, fs, {port = 445, proto = .TCP, name = "smb", product = "Samba", version = "4.5.9"})
-	sim.add_account(w, fs, {username = "svc", password = SVC_PASSWORD})
-
-	sim.add_file(
-		w,
-		fs,
-		{
-			path = "/srv/backup/manifest.sql",
-			content = "-- northwind logistics :: consignment manifest\n-- 2026-07 export\nINSERT INTO consignments VALUES (88412,'ROTTERDAM','SEALED');\nINSERT INTO consignments VALUES (88413,'FELIXSTOWE','SEALED');",
-			sensitive = true,
-			objective = true,
-		},
-	)
-	sim.add_file(w, fs, {path = "/srv/backup/README", content = "nightly dumps land here at 0200."})
-
-	// --- routing ------------------------------------------------------------
-
-	// The VPS has a route into the DMZ; that is what the contract bought.
-	append(&w.links, sim.Link{from = wan, to = dmz, via = origin, min_access = .User})
-	// CORP is reachable only through jump01, and only with root on it.
-	append(&w.links, sim.Link{from = dmz, to = corp, via = jump, min_access = .Root})
-
-	return origin
+	push(w, term, "", .Text)
+	if next, ok := campaign.next_level(progress); ok && next.number != level.number {
+		push(w, term, fmt.aprintf("`play %d` for the next level, or `levels`.", next.number, allocator = w.allocator), .Dim)
+	} else {
+		push(w, term, "`levels` to choose another, or `retry` this one.", .Dim)
+	}
 }

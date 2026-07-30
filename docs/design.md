@@ -3,6 +3,11 @@
 The reference the remaining milestones build toward. Entries marked ✅ are
 implemented; everything else is intent, not implementation.
 
+**Ceph.Sec is a learning game.** It is structured as a campaign of ~60 levels
+following MITRE ATT&CK, each teaching a technique and unlocking what it taught.
+Sections 1-7 describe the systems; section 11 describes the curriculum those
+systems exist to carry.
+
 Noise values marked ✅ are the tuned figures actually in use; the rest are
 targets for tools that do not exist yet.
 
@@ -24,8 +29,12 @@ game is that choice, repeated under a clock.
 just hit the weakest host and win. Reaching what you want means getting from the
 segment you landed in to the segment that holds it.
 
-**Runs are short and lossy.** 15–40 minutes. You lose runs. What persists is
-your toolkit and what you learned.
+**Every level teaches something nameable.** Not "you finished it" but "you
+performed T1078.003, this is why it works, this is how it is stopped". The
+debrief is the payload; the level is how the payload is earned.
+
+**Levels are short and repeatable.** Failing and immediately retrying is the
+learning loop, which is why `retry` matters more here than a save file does.
 
 ---
 
@@ -42,7 +51,7 @@ side of the work continuing.
 
 ---
 
-## 3. Run structure
+## 3. Level structure
 
 ```
 brief → insertion → recon → enumerate → exploit → pivot ─┐
@@ -55,9 +64,11 @@ You start with a foothold: a rented VPS, a phished workstation, a misconfigured
 edge device. The brief names an objective — a file, a database, a credential
 set, or persistence itself.
 
-A run ends when you extract (win), the trace completes (caught), or you burn
-your access and can no longer reach the objective (stranded — a real and
-distinct failure, and the one worth designing carefully).
+A level ends when its objectives are met (and the debrief explains what you just
+did), or the trace completes (caught). "Stranded" — no path to the objective
+remains — is deliberately not detected: deciding that correctly needs an
+attack-graph prover, and a heuristic would lie at the worst possible moment.
+Levels are instead built so it cannot arise.
 
 ---
 
@@ -263,17 +274,21 @@ solvable only by brute-forcing everything is a run the trace wins by design.
 
 ---
 
-## 9. Meta-progression
+## 9. Progression ✅
 
-Runs are short and lossy, so something has to carry across them.
+Progression is the curriculum, not a meta-game.
 
-- **Tools** — the roster above unlocks over time; early runs are deliberately
-  under-equipped
-- **Hardware** — more job slots, faster cracking, bigger wordlists
-- **Intel** — recurring clients mean partial maps of networks you've hit before
-- **Reputation** — gates which briefs you're offered
+- **Tools** unlock by completing the level that teaches them. `ssh` is
+  unavailable until level 4, and `help` says so rather than hiding it — seeing
+  what is coming is part of the teaching.
+- **Levels** unlock through a prerequisite graph, validated acyclic at build.
+- **Coverage** is tracked per ATT&CK technique, shown by `techniques`.
 
-Explicitly *not* carried: access. Every run starts cold.
+A level declares its *available* tools separately from what it *grants*, so a
+later level can withhold something you own — "you have `ssh`, but 22 is filtered
+here" — which is how difficulty grows without inventing new mechanics.
+
+Not carried: access, credentials, world state. Every level starts cold.
 
 ---
 
@@ -299,3 +314,46 @@ configured not to, incapable.
 What a player takes away is the *shape* of security work: why versions matter,
 why password reuse is catastrophic, why segmentation is worth the pain, why
 being loud loses. That's knowledge that helps defenders.
+
+---
+
+## 11. The curriculum ✅
+
+Levels follow ATT&CK's tactics in kill-chain order, in blocks of roughly four:
+
+    teach  →  teach  →  apply  →  combine
+
+The **combine** levels are what stop the campaign reading as a syllabus. They
+demand techniques from earlier blocks with nothing saying which, and they are
+where the game stops testing recall and starts testing judgement.
+
+**Techniques are not tools.** T1078 *Valid Accounts* and T1110 *Brute Force*
+both yield credentials and both may use `ssh`. Across ~60 levels only 15–20
+grant a new command; the rest teach a technique, an application, or a
+combination using what the player already holds. A design that granted one tool
+per level would need sixty tools and teach almost nothing.
+
+### What keeps 60 levels honest
+
+Authored content rots the same way generated content does — it just rots when
+someone edits it rather than when the RNG rolls badly. Two test suites stand in
+for the attack-graph prover that procedural generation would have needed:
+
+- **The validator** (`tests/campaign_test.odin`) proves the prerequisite graph
+  is acyclic, that no level offers a tool its prerequisites cannot have granted,
+  that every granted tool is a real command granted exactly once, and — by
+  building each level — that every objective points at something that exists.
+- **The playthroughs** (`tests/playthrough_test.odin`) finish every level using
+  only that level's own tools. A level that stops being winnable fails there,
+  rather than in front of someone who cannot tell whether it is them or the game.
+
+Each level's walkthrough doubles as its reference solution, so a design change
+shows up as a failing test with the objective named.
+
+### The honest limits
+
+ATT&CK is a taxonomy of observed adversary behaviour, not a syllabus. Much of
+Resource Development concerns infrastructure this game does not model, and much
+of Impact is destructive in ways it will not teach. The campaign covers a subset
+deliberately, and `techniques` reports coverage against the catalogue it
+actually implements rather than against the whole matrix.
