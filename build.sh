@@ -50,7 +50,10 @@ fi
 # here. The previous allowlist meant a package added later was ungated by
 # accident and silently; naming an exemption is now a deliberate, reviewable act
 # of granting something the ability to touch the outside world.
-GATE_EXEMPT="src/ui"
+# src/ui talks to raylib; src/save is the one place allowed to touch the
+# filesystem, and it knows nothing about the game -- it reads and writes a list
+# of strings, so `campaign` never learns a filesystem exists.
+GATE_EXEMPT="src/ui src/save"
 
 gate_packages() {
     for d in src/*/; do
@@ -216,6 +219,8 @@ do_check() {
     echo "  src/campaign .... ok"
     "$ODIN" check src/shell -no-entry-point
     echo "  src/shell ....... ok"
+    "$ODIN" check src/save -no-entry-point
+    echo "  src/save ........ ok"
     "$ODIN" check src/ui -no-entry-point
     echo "  src/ui .......... ok"
     "$ODIN" check src

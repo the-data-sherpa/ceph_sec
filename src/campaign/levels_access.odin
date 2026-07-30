@@ -127,7 +127,8 @@ LEVEL_LATERAL_REUSE := Level {
 		"Find the hosts on 10.0.6.0/24, take the credential the",
 		"portal is leaking, and see how far it goes.",
 		"",
-		"Try: ssh <user>@<host>",
+		"ssh logs in with a credential you hold. `help ssh` for the",
+		"syntax.",
 	},
 	objectives = {
 		{text = "Obtain the service credential", goal = Goal_Obtain_Credential{"svc-backup"}},

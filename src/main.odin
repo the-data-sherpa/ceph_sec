@@ -7,6 +7,7 @@ import "core:strings"
 import "campaign"
 import "input"
 import "shell"
+import "save"
 import "sim"
 import "ui"
 
@@ -40,6 +41,14 @@ main :: proc() {
 	progress: campaign.Progress
 	campaign.progress_init(&progress)
 	defer campaign.progress_destroy(&progress)
+
+	// Where progress is kept, and whether it can be kept at all. A machine with
+	// no home directory -- a container, a CI runner -- plays fine and simply
+	// forgets, which is better than refusing to start.
+	progress_path, can_save := save.save_path()
+	if can_save && !opts.no_save {
+		load_progress(&progress, progress_path)
+	}
 
 	sess: shell.Session
 
@@ -102,7 +111,18 @@ main :: proc() {
 			if settled && !debriefed && sess.level != nil && campaign.level_complete(&w, sess.level) {
 				debriefed = true
 				debrief_pending = true
-				campaign.mark_complete(&progress, sess.level.id)
+				// Written the moment a level is finished rather than at exit,
+				// because the exits that matter -- a crash, a kill, closing the
+				// window mid-thought -- are exactly the ones that never reach an
+				// exit path.
+				if campaign.mark_complete(&progress, sess.level.id) && can_save && !opts.no_save {
+					// Reported, not swallowed. A campaign that silently stops
+					// recording is worse than one that never recorded at all,
+					// because the player only finds out when they come back.
+					if !save.write(progress_path, campaign.completed_ids(&progress)) {
+						fmt.eprintfln("warning: could not write progress to %s", progress_path)
+					}
+				}
 			}
 
 			// Feeding also stops while a level change is pending. `play` is a
@@ -189,8 +209,9 @@ main :: proc() {
 // --- arguments --------------------------------------------------------------
 
 Options :: struct {
-	shot: Autoshot,
-	exec: []string,
+	shot:    Autoshot,
+	exec:    []string,
+	no_save: bool, // play without reading or writing progress
 }
 
 // `--shot <seconds> [path]` runs to a fixed point on the sim clock, writes a
@@ -697,6 +718,48 @@ footer :: proc(g: ^ui.Grid, app: ^ui.App, term: ^ui.Term, dropped: u64) {
 		ui.grid_write(g, GRID_W - len(tag) - 1, y, tag, .Bad, .Bg_Panel)
 	}
 }
+// Reads saved progress, and says plainly when it cannot.
+//
+// A save is a text file in a directory the player can reach, so it will be
+// hand-edited and truncated eventually. None of those cases may lose a campaign
+// silently: an unreadable save is reported and left alone rather than
+// overwritten, so whatever is in it can still be recovered by hand.
+load_progress :: proc(p: ^campaign.Progress, path: string) {
+	loaded, result := save.load(path, context.temp_allocator)
+
+	switch result {
+	case .Ok:
+		// Ids are matched against the campaign rather than trusted. A level
+		// renamed or removed between builds leaves an id that means nothing;
+		// dropping it silently is right, because the alternative is a save that
+		// unlocks a level that no longer exists.
+		kept, dropped := 0, 0
+		for id in loaded.completed {
+			if _, exists := campaign.level_by_id(id); exists {
+				campaign.mark_complete(p, id)
+				kept += 1
+			} else {
+				dropped += 1
+			}
+		}
+		if dropped > 0 {
+			fmt.eprintfln("note: %d saved level(s) no longer exist and were ignored", dropped)
+		}
+
+	case .Missing:
+		// A new player. Not a problem, and not worth a message.
+
+	case .Unreadable:
+		fmt.eprintfln("could not read %s -- starting fresh, and leaving it alone", path)
+
+	case .Malformed:
+		fmt.eprintfln("%s is not a Ceph.Sec save -- starting fresh, and leaving it alone", path)
+
+	case .Newer_Version:
+		fmt.eprintfln("%s was written by a newer build -- starting fresh, and leaving it alone", path)
+	}
+}
+
 // --- levels -----------------------------------------------------------------
 
 // Starting or restarting a level, and the one place it may happen.

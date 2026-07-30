@@ -111,7 +111,8 @@ LEVEL_RECON_VERSIONS := Level {
 		"actually listening on 10.0.7.0/24 -- software and version,",
 		"not just ports.",
 		"",
-		"Try: nmap -sV 10.0.7.0/24",
+		"nmap again, but a sweep will not tell you this. `hint` if",
+		"you need it.",
 	},
 	objectives = {
 		{text = "Identify the web service on app01", goal = Goal_Discover_Service{"app01", 8080}},

@@ -46,6 +46,10 @@ and honours `ODIN=` if it lives elsewhere.
 ./build.sh all        # check + test + build
 ```
 
+Progress is saved as each level is completed, so the campaign survives closing
+the game — under `$XDG_DATA_HOME/cephsec` on Linux, `Application Support` on
+macOS, `%APPDATA%` on Windows. `--no-save` plays without reading or writing it.
+
 While running: `levels` lists the campaign, `play <n>` starts one, `objectives`
 shows your goals, `hint` gives an escalating nudge, `retry` restarts, and
 `techniques` shows your ATT&CK coverage.
@@ -86,6 +90,7 @@ A directory is a package in Odin, and imports may only point downward.
 ```
 src/sim/       simulation core — world, scheduler, events, trace. Deterministic.
 src/campaign/  ATT&CK catalogue, level definitions, progress. Pure content.
+src/save/      progress persistence — the one package allowed to touch disk.
 src/shell/     parsing, commands, jobs, tools. Pure — nmap and ssh live here.
 src/input/     shared key vocabulary. No dependencies at all.
 src/ui/        character grid, terminal, CRT pipeline — the only raylib consumer
