@@ -24,7 +24,7 @@ App :: struct {
 	screenshots: int,
 }
 
-app_init :: proc(app: ^App, title: cstring, grid_w, grid_h: int, shader_path: cstring) {
+app_init :: proc(app: ^App, title: cstring, grid_w, grid_h: int) {
 	rl.SetConfigFlags({.WINDOW_RESIZABLE, .VSYNC_HINT})
 	rl.SetTraceLogLevel(.WARNING)
 
@@ -51,7 +51,7 @@ app_init :: proc(app: ^App, title: cstring, grid_w, grid_h: int, shader_path: cs
 	// along every glyph edge.
 	rl.SetTextureFilter(app.target.texture, .BILINEAR)
 
-	app.crt = crt_load(shader_path)
+	app.crt = crt_load()
 	app.crt_enabled = app.crt.ok
 }
 

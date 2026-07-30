@@ -1,0 +1,113 @@
+name: ci
+
+# Everything here was previously verified by one person, on one machine, by
+# remembering to type it. The purity gate especially: it is the mechanism behind
+# this project's central claim, and until now it ran only when asked. Four
+# bypasses had accumulated in it unnoticed.
+on:
+  push:
+    branches: [main, dev, "m*", "infra*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ODIN_VERSION: dev-2026-07a
+
+jobs:
+  # Runs first and alone, because it needs no compiler and no toolchain: it is
+  # pure shell over the source text. A gate violation should be reported in
+  # seconds rather than after a full build, and the gate self-test means this
+  # job also proves the gate can still catch what it claims to.
+  gate:
+    name: purity gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gate self-test and scan
+        run: ./build.sh gate
+
+  build-and-test:
+    name: build and test
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain is a ~65MB tarball and the release is immutable, so the
+      # cache key is the version alone. A cold run costs the download; every
+      # other run costs nothing.
+      - name: Cache Odin
+        id: cache-odin
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/odin
+          key: odin-${{ env.ODIN_VERSION }}-linux-amd64
+
+      - name: Install Odin
+        if: steps.cache-odin.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.local/odin
+          curl -fsSL -o /tmp/odin.tar.gz \
+            "https://github.com/odin-lang/Odin/releases/download/${ODIN_VERSION}/odin-linux-amd64-${ODIN_VERSION}.tar.gz"
+          tar -xzf /tmp/odin.tar.gz --strip-components=1 -C ~/.local/odin
+          chmod +x ~/.local/odin/odin
+
+      - name: Report toolchain
+        run: |
+          echo "PATH entry: $HOME/.local/odin"
+          ~/.local/odin/odin version
+          # build.sh falls back to gcc via ODIN_CLANG_PATH when clang is absent;
+          # Odin only uses it as a linker frontend. Report which one CI picked so
+          # a linker-specific failure is not a mystery.
+          command -v clang >/dev/null && clang --version | head -1 || echo "clang absent -- build.sh will use gcc"
+
+      - name: Check every package
+        run: ./build.sh check
+
+      # The suites are headless: nothing here opens a window. Only the game
+      # binary calls InitWindow, and this job never runs it.
+      - name: Test
+        run: ./build.sh test
+
+      - name: Release build
+        run: ./build.sh release
+
+      # A binary that only works from the repository root is one nobody else can
+      # run -- and for three milestones this one silently lost its shader when
+      # moved, which looked like a design choice rather than a bug. Copying it
+      # somewhere empty and rendering a real frame is what stops that returning.
+      #
+      # The runner is headless, so raylib needs a virtual display. This is the
+      # only step that opens a window; the test suites are all headless.
+      - name: Install xvfb
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
+
+      - name: Smoke-test the binary outside the repo
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/relocated && cp build/cephsec /tmp/relocated/
+          cd /tmp/relocated
+          # --shot runs to a fixed sim tick, writes a PNG and exits. It
+          # exercises window creation, shader compilation and the whole render
+          # path -- so it fails if the binary cannot stand on its own.
+          xvfb-run -a ./cephsec --shot 2 frame.png 2>err.log
+          test -s frame.png || { echo "no frame rendered"; cat err.log; exit 1; }
+          # The shader is compiled in, so any complaint about it is now a real
+          # failure rather than a missing file.
+          if grep -qi "shader" err.log; then
+            echo "the CRT shader did not load in a relocated binary:"; cat err.log; exit 1
+          fi
+          echo "rendered $(stat -c%s frame.png) bytes with the shader intact"
+
+      - name: Upload the smoke-test frame
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-frame
+          path: /tmp/relocated/frame.png
+          if-no-files-found: ignore

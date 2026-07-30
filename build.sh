@@ -248,7 +248,7 @@ case "${1:-all}" in
     test)    do_test ;;
     debug)   do_build debug ;;
     release) do_build release ;;
-    # Launched from the repo root so the relative asset paths resolve.
+    # The binary embeds its own assets, so this is only convenience.
     run)     do_build debug && ./"$OUT_DIR/cephsec" ;;
     all)     do_check && do_test && do_build debug ;;
     *)       echo "usage: $0 {check|gate|test|run|debug|release|all}" >&2; exit 2 ;;

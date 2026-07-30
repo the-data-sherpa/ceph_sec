@@ -44,11 +44,13 @@ main :: proc() {
 	sess: shell.Session
 
 	app: ui.App
-	ui.app_init(&app, "Ceph.Sec", GRID_W, GRID_H, "assets/shaders/crt.fs")
+	ui.app_init(&app, "Ceph.Sec", GRID_W, GRID_H)
 	defer ui.app_shutdown(&app)
 
+	// The shader is compiled into the binary, so this can only mean the GPU
+	// rejected it -- a real problem worth reporting, not a missing file.
 	if !app.crt.ok {
-		fmt.eprintln("warning: crt.fs failed to load; rendering without the screen effect")
+		fmt.eprintln("warning: the CRT shader did not compile; rendering without it")
 	}
 
 	keys: ui.Input_State

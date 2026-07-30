@@ -75,6 +75,10 @@ convenience — worth having early for a game whose look is carried by a shader.
 Paths are resolved by raylib relative to the working directory; absolute paths
 are not honoured.
 
+The binary is self-contained — the CRT shader is compiled into it — so it runs
+from anywhere with no assets alongside it. CI proves that by copying it to an
+empty directory and rendering a frame.
+
 ## Layout
 
 A directory is a package in Odin, and imports may only point downward.
