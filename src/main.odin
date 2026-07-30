@@ -63,6 +63,7 @@ main :: proc() {
 	start_level(&w, &sess, &term, &progress, first)
 
 	debriefed := false
+	debrief_pending := false
 
 	// Commands queued by --exec, fed in one at a time as the shell frees up.
 	next_queued := 0
@@ -84,7 +85,34 @@ main :: proc() {
 			// made the tick they landed on depend on the frame rate, which is
 			// exactly the frame-quantisation the determinism guarantee forbids.
 			shell.session_update(&sess)
-			if next_queued < len(opts.exec) && !shell.session_busy(&sess) && !sim.run_over(&w) {
+
+			// Completion is *detected* here, inside the tick loop, because
+			// whether a level is finished at tick T must not depend on where
+			// the frame boundary fell -- and because anything deciding what to
+			// do next (the feeder below, a player typing `play`) has to see it
+			// immediately. Rendering the debrief is a separate, frame-timed
+			// concern; see below.
+			//
+			// Held until everything has settled: the last objective often falls
+			// part-way through a tool's output, and a debrief landing mid-scan
+			// reads as though the game interrupted itself.
+			settled := !shell.session_active(&sess) && len(w.timers) == 0
+			if settled && !debriefed && sess.level != nil && campaign.level_complete(&w, sess.level) {
+				debriefed = true
+				debrief_pending = true
+				campaign.mark_complete(&progress, sess.level.id)
+			}
+
+			// Feeding also stops while a level change is pending. `play` is a
+			// builtin, so it leaves the shell idle -- without this the next
+			// scripted command dispatches in the same tick, against the world
+			// the transition is about to replace. A human typing one command at
+			// a time never sees it; a scripted playthrough sees nothing else.
+			_, changing_level := sess.pending_transition.?
+			if next_queued < len(opts.exec) &&
+			   !shell.session_busy(&sess) &&
+			   !changing_level &&
+			   !sim.run_over(&w) {
 				shell.session_exec(&sess, opts.exec[next_queued])
 				next_queued += 1
 			}
@@ -116,18 +144,10 @@ main :: proc() {
 
 		drain_events(&w, &term)
 
-		// Level completion is checked from world state rather than announced by
-		// a command, so it fires however the player got there -- including on a
-		// route the level's author did not anticipate.
-		//
-		// Held until everything has settled. The last objective often falls
-		// part-way through a tool's output -- the third host of a sweep is found
-		// before the sweep finishes printing -- and a debrief landing mid-scan
-		// reads as though the game interrupted itself.
-		settled := !shell.session_active(&sess) && len(w.timers) == 0
-		if settled && !debriefed && sess.level != nil && campaign.level_complete(&w, sess.level) {
-			debriefed = true
-			campaign.mark_complete(&progress, sess.level.id)
+		// Rendered after draining, so the level's own final lines land above the
+		// summary rather than after it.
+		if debrief_pending {
+			debrief_pending = false
 			level_debrief(&w, sess.level, &progress, &term)
 			ui.term_scroll_to_bottom(&term)
 		}
@@ -146,6 +166,7 @@ main :: proc() {
 			if target, ok := campaign.level_by_number(t.level); ok {
 				start_level(&w, &sess, &term, &progress, target)
 				debriefed = false
+				debrief_pending = false
 				continue
 			}
 		}

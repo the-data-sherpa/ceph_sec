@@ -111,6 +111,39 @@ build_northwind :: proc(w: ^sim.World) -> sim.Handle(sim.Host) {
 	jump := sim.add_host(w, "jump01", sim.addr(10, 0, 4, 19), dmz, "Ubuntu 20.04")
 	sim.add_service(w, jump, {port = 22, proto = .TCP, name = "ssh", product = "OpenSSH", version = "8.2p1"})
 
+	// A jump box's own history is what tells you where it jumps to.
+	//
+	// Without these, taking jump01 leaves you standing on a bare machine
+	// expected to know an address range nothing has told you -- the CORP range
+	// is stated only in the contract back on your own VPS, which you have just
+	// left. That is the difference between a level being solvable and being
+	// discoverable, and it is a real lesson in its own right: the first thing
+	// worth reading on a host you have just taken is what it talks to.
+	sim.add_file(
+		w,
+		jump,
+		{
+			path = "/home/svc/.bash_history",
+			content = "ssh svc@10.0.9.10\nrsync -a /srv/exports/ svc@10.0.9.10:/srv/backup/\nsudo tcpdump -i eth1 -w /tmp/cap.pcap",
+		},
+	)
+	sim.add_file(
+		w,
+		jump,
+		{
+			path = "/etc/hosts",
+			content = "127.0.0.1 localhost\n10.0.4.19 jump01\n10.0.9.10 fs01.northwind.internal fs01\n10.0.9.20 dc01.northwind.internal",
+		},
+	)
+	sim.add_file(
+		w,
+		jump,
+		{
+			path = "/etc/network/interfaces",
+			content = "# dual-homed: DMZ and internal\nauto eth0\niface eth0 inet static\n  address 10.0.4.19/24\n\nauto eth1\niface eth1 inet static\n  address 10.0.9.19/24",
+		},
+	)
+
 	// The reused password. `svc` exists on several boxes with the same
 	// password, which is the entire lateral-movement mechanic and needs no
 	// special case anywhere: ssh just compares strings.

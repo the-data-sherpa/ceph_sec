@@ -74,12 +74,22 @@ cmd_levels :: proc(s: ^Session, cmd: ^Command) {
 	}
 
 	out(s, "levels:", .Info)
-	current_tactic := campaign.Tactic(255)
+	current_heading := ""
 
 	for &l in campaign.LEVELS {
-		if len(l.techniques) > 0 && l.techniques[0].tactic != current_tactic {
-			current_tactic = l.techniques[0].tactic
-			out(s, fmt.tprintf("  [%s]", campaign.tactic_name(current_tactic)), .Info)
+		// Combine levels are grouped as a synthesis rather than under a tactic.
+		// Filing one under whichever technique happens to be listed first is
+		// misleading -- the whole point of a combine level is that it belongs to
+		// several -- and it makes the same tactic appear twice in the listing.
+		heading := ""
+		if l.kind == .Combine {
+			heading = "synthesis"
+		} else if len(l.techniques) > 0 {
+			heading = campaign.tactic_name(l.techniques[0].tactic)
+		}
+		if heading != current_heading && len(heading) > 0 {
+			current_heading = heading
+			out(s, fmt.tprintf("  [%s]", heading), .Info)
 		}
 
 		done := campaign.is_complete(s.progress, l.id)

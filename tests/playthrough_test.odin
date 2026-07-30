@@ -280,6 +280,128 @@ test_the_combine_level_is_survivable :: proc(t: ^testing.T) {
 	}
 }
 
+// --- discoverability --------------------------------------------------------
+
+// Solvable is not the same as discoverable, and the walkthrough test above
+// cannot tell the difference: it knows the answers.
+//
+// This caught a real failure in the combine level. Taking the jump box left the
+// player on a host with no files at all, expected to scan an internal range
+// stated only in a file back on the machine they had just left. The level
+// finished perfectly in tests and stranded a human being.
+//
+// So: before each step, every address the step targets must be knowable from
+// where the player is *standing* -- the brief, or a file on the host under the
+// prompt. Holding a host they walked away from does not count, because reading
+// it means already knowing to go back.
+@(private)
+network_prefix :: proc(arg: string) -> (string, bool) {
+	// "10.0.9.0/24" and "10.0.9.10" both reduce to "10.0.9." -- the granularity
+	// at which a clue is useful. A hostname or a URL path is not an address.
+	digits, dots := 0, 0
+	for i in 0 ..< len(arg) {
+		c := arg[i]
+		switch {
+		case c >= '0' && c <= '9':
+			digits += 1
+		case c == '.':
+			dots += 1
+			if dots == 3 {
+				return arg[:i + 1], digits > 0
+			}
+		case:
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// Pulls the address out of a step, whatever syntax the tool uses.
+@(private)
+step_target :: proc(step: string) -> (string, bool) {
+	toks, err := shell.lex(step, context.temp_allocator)
+	if err != .None {
+		return "", false
+	}
+	for tok in toks[1:] {
+		arg := tok
+		// user@host
+		if at := strings.index_byte(arg, '@'); at >= 0 {
+			arg = arg[at + 1:]
+		}
+		// http://host/path
+		if strings.has_prefix(arg, "http://") {
+			arg = arg[7:]
+		} else if strings.has_prefix(arg, "https://") {
+			arg = arg[8:]
+		}
+		if slash := strings.index_byte(arg, '/'); slash >= 0 && strings.count(arg, ".") >= 3 {
+			arg = arg[:slash] // strip a URL path, keep a CIDR's own slash out
+		}
+		if prefix, ok := network_prefix(arg); ok {
+			return prefix, true
+		}
+	}
+	return "", false
+}
+
+@(test)
+test_every_step_targets_something_the_player_could_know :: proc(t: ^testing.T) {
+	for &level in campaign.LEVELS {
+		wt, has := walkthrough_for(level.id)
+		if !has {
+			continue
+		}
+
+		p: Play
+		play_open(&p, &level)
+		defer play_close(&p)
+
+		for step in wt.steps {
+			prefix, targeted := step_target(step)
+			if targeted {
+				known := false
+
+				// Stated in the brief?
+				for line in level.brief {
+					if strings.contains(line, prefix) {
+						known = true
+						break
+					}
+				}
+
+				// Or readable on the host under the prompt right now?
+				if !known {
+					if host, ok := sim.pool_get(&p.w.hosts, p.sess.host); ok {
+						for f in host.files {
+							if strings.contains(f.content, prefix) || strings.contains(f.path, prefix) {
+								known = true
+								break
+							}
+						}
+					}
+				}
+
+				host_name := "?"
+				if host, ok := sim.pool_get(&p.w.hosts, p.sess.host); ok {
+					host_name = host.hostname
+				}
+				testing.expectf(
+					t,
+					known,
+					"level %d (%s): %q targets %s*, but standing on %s nothing states it -- solvable, not discoverable",
+					level.number,
+					level.id,
+					step,
+					prefix,
+					host_name,
+				)
+			}
+			play_do(&p, step)
+		}
+	}
+}
+
 // --- gating -----------------------------------------------------------------
 
 @(test)
@@ -358,6 +480,143 @@ test_progression_unlocks_tools :: proc(t: ^testing.T) {
 	late := campaign.unlocked_tools(&p, context.temp_allocator)
 	testing.expect(t, has(late, "ssh"), "ssh should be available after level 4")
 	testing.expect(t, has(late, "curl"))
+}
+
+// --- the campaign commands --------------------------------------------------
+
+// `play` is how every level after the first is reached, and it shipped
+// untested. The bug it hid was in main's loop rather than here -- completion was
+// recorded after the tick loop while scripted commands were fed inside it, so
+// `play 2` immediately after finishing level 1 was refused as locked -- but a
+// command nothing exercises is a command nothing protects.
+@(test)
+test_play_accepts_an_unlocked_level :: proc(t: ^testing.T) {
+	level, _ := campaign.level_by_id("recon-sweep")
+
+	p: Play
+	play_open(&p, level)
+	defer play_close(&p)
+
+	// Level 2 is locked until level 1 is recorded complete.
+	play_do(&p, "play 2")
+	testing.expect(t, strings.contains(play_transcript(&p), "locked"))
+	_, wants_early := p.sess.pending_transition.?
+	testing.expect(t, !wants_early, "a locked level must not be scheduled")
+
+	// Finish level 1 the way a player would, then ask again.
+	play_do(&p, "nmap -sn 10.0.4.0/24")
+	testing.expect(t, campaign.level_complete(&p.w, level))
+	campaign.mark_complete(&p.prog, level.id)
+	play_transcript(&p)
+
+	play_do(&p, "play 2")
+	transition, wants := p.sess.pending_transition.?
+	testing.expect(t, wants, "play should schedule the transition once unlocked")
+	if wants {
+		testing.expect_value(t, transition.level, 2)
+		testing.expect(t, !transition.retry)
+	}
+}
+
+@(test)
+test_play_names_what_is_missing :: proc(t: ^testing.T) {
+	level, _ := campaign.level_by_id("recon-sweep")
+
+	p: Play
+	play_open(&p, level)
+	defer play_close(&p)
+
+	play_do(&p, "play 5")
+	text := play_transcript(&p)
+	testing.expect(t, strings.contains(text, "locked"))
+	// Naming the prerequisite is the difference between a refusal that helps
+	// and one that only blocks.
+	testing.expect(t, strings.contains(text, "finish level"), "the refusal should name a prerequisite")
+
+	play_do(&p, "play 99")
+	testing.expect(t, strings.contains(play_transcript(&p), "no level 99"))
+}
+
+@(test)
+test_retry_schedules_the_current_level :: proc(t: ^testing.T) {
+	level, _ := campaign.level_by_id("access-exposure")
+
+	p: Play
+	play_open(&p, level)
+	defer play_close(&p)
+
+	play_do(&p, "retry")
+	transition, wants := p.sess.pending_transition.?
+	testing.expect(t, wants, "retry should schedule a transition")
+	if wants {
+		testing.expect_value(t, transition.level, level.number)
+		testing.expect(t, transition.retry, "and mark it as a retry")
+	}
+}
+
+@(test)
+test_objectives_reflects_progress :: proc(t: ^testing.T) {
+	level, _ := campaign.level_by_id("recon-sweep")
+
+	p: Play
+	play_open(&p, level)
+	defer play_close(&p)
+
+	play_do(&p, "objectives")
+	before := play_transcript(&p)
+	testing.expect(t, strings.contains(before, "[ ]"), "unmet objectives should be shown unticked")
+	testing.expect(t, !strings.contains(before, "[x]"))
+	// The technique is named here too -- this is the level's ATT&CK label.
+	testing.expect(t, strings.contains(before, "T1595.001"))
+
+	play_do(&p, "nmap -sn 10.0.4.0/24")
+	play_transcript(&p)
+
+	play_do(&p, "objectives")
+	after := play_transcript(&p)
+	testing.expect(t, strings.contains(after, "[x]"), "met objectives should tick")
+	testing.expect(t, !strings.contains(after, "[ ]"), "all three should be met")
+}
+
+@(test)
+test_levels_marks_done_and_locked :: proc(t: ^testing.T) {
+	level, _ := campaign.level_by_id("recon-versions")
+
+	p: Play
+	play_open(&p, level) // play_open completes everything before level 2
+	defer play_close(&p)
+
+	play_do(&p, "levels")
+	text := play_transcript(&p)
+
+	testing.expect(t, strings.contains(text, "Knock and see who answers"), "levels should list level 1")
+	// Odin's %2d zero-pads, so levels render as 01..60 -- which suits a campaign
+	// of sixty and keeps the column aligned.
+	testing.expect(t, strings.contains(text, "x 01"), "a finished level should be marked done")
+	testing.expect(t, strings.contains(text, "> 02"), "the level in progress should be marked")
+	testing.expect(t, strings.contains(text, "- 05"), "a locked level should be marked locked")
+	// A combine level spans several tactics, so it is grouped as a synthesis
+	// rather than filed under whichever technique is listed first.
+	testing.expect(t, strings.contains(text, "[synthesis]"), "combine levels group separately")
+}
+
+@(test)
+test_techniques_reports_coverage :: proc(t: ^testing.T) {
+	level, _ := campaign.level_by_id("recon-versions")
+
+	p: Play
+	play_open(&p, level)
+	defer play_close(&p)
+
+	play_do(&p, "techniques")
+	text := play_transcript(&p)
+
+	testing.expect(t, strings.contains(text, "Recon"), "tactics with catalogued techniques should appear")
+	testing.expect(t, strings.contains(text, "techniques covered"), "and a total")
+
+	// Level 1 is complete in this fixture, so at least one technique is covered.
+	covered := campaign.covered_techniques(&p.prog, context.temp_allocator)
+	testing.expect(t, len(covered) > 0)
 }
 
 // --- retry ------------------------------------------------------------------
