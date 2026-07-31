@@ -180,12 +180,15 @@ to retrofit once tools and gameplay exist.
    accident. That rule is now itself tested rather than trusted, which matters
    because `src/replay` — a hand-written parser for files from strangers — is
    the package you would least like to find outside the gate. And the gate is
-   tested: `build.sh gate` runs a self-test of 19 classes before it runs. That
+   tested: `build.sh gate` runs a self-test of 21 classes before it runs. That
    is not ceremony. Through M3 the gate accepted
    `foreign import libc "system:c"` — a complete route to `socket(2)` needing no
    import statement at all — along with `fmt.printfln`, aliased imports like
    `import os7 "core:os"`, and any newly added package. Writing the self-test is
-   how those were found.
+   how those were found. The exemption list itself is pinned to a literal for
+   the same reason: until I3 it was not, so adding `src/sim` to `GATE_EXEMPT`
+   left the whole gate reporting `ok`, and the only signal was a shorter package
+   list on a line nobody reads.
 2. **The sim does not render.** It appends to an event ring; the frontend drains
    it. Enforced by Odin's import rules.
 3. **The sim is deterministic.** It advances only via `sim.tick()` at a fixed

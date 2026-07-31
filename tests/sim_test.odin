@@ -219,6 +219,39 @@ test_rng_shuffle_is_a_permutation :: proc(t: ^testing.T) {
 
 // --- event ring -------------------------------------------------------------
 
+// The event digest must cover WHEN, not only what and in what order.
+//
+// This is what a replay mark compares, and almost everything that can silently
+// go wrong in this simulation is a function of elapsed ticks -- trace accrual,
+// decay, the grace window, hunt escalation. A digest blind to timing would let
+// the whole regression corpus pass through a retiming bug while reporting that
+// the run reproduced exactly. It did: before the ring carried `now`, these two
+// sequences hashed identically.
+@(test)
+test_the_event_digest_covers_timing :: proc(t: ^testing.T) {
+	digest_at :: proc(ticks: [2]sim.Tick) -> u64 {
+		r: sim.Event_Ring
+		sim.ring_clear(&r)
+		r.now = ticks[0]
+		sim.ring_push(&r, sim.Ev_Log{text = "one"})
+		r.now = ticks[1]
+		sim.ring_push(&r, sim.Ev_Log{text = "two"})
+		return r.digest
+	}
+
+	early := digest_at({10, 20})
+	late := digest_at({100, 500})
+	testing.expectf(
+		t,
+		early != late,
+		"the same lines at different ticks hashed the same (0x%x) -- the digest is blind to pacing",
+		early,
+	)
+
+	// And it is still a pure function of the run: same timing, same digest.
+	testing.expect_value(t, digest_at({10, 20}), early)
+}
+
 @(test)
 test_ring_fifo :: proc(t: ^testing.T) {
 	r: sim.Event_Ring

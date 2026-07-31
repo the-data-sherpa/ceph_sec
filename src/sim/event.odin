@@ -122,10 +122,29 @@ Event_Ring :: struct {
 	// Zero on a bare Event_Ring rather than FNV_OFFSET; ring_clear seeds it, and
 	// every World gets one through world_bind.
 	digest: u64,
+
+	// The tick the simulation is currently on, folded into the digest with each
+	// event so that WHEN something was said is covered, not only what and in
+	// what order.
+	//
+	// Without this the digest is blind to pacing: two runs emitting the same
+	// lines, one at ticks 10 and 20 and the other at ticks 100 and 500, hash
+	// identically. That is exactly the class of bug this simulation is most
+	// prone to -- trace accrual, decay, grace windows and hunt escalation are
+	// all functions of elapsed ticks -- and it is the class a replay was
+	// supposed to catch. Marks are hundreds of ticks apart, so any retiming that
+	// resolved between two marks was invisible to the corpus while the goldens
+	// caught it, which made the corpus look like a stronger check than it was.
+	//
+	// Pushed down here from `tick` rather than passed to ring_push, which would
+	// mean touching fifteen call sites across four files to carry a value the
+	// ring can simply be told.
+	now: Tick,
 }
 
 ring_push :: proc(r: ^Event_Ring, e: Event) {
 	d := Digest{h = r.digest}
+	digest_u64(&d, u64(r.now))
 	digest_event(&d, e)
 	r.digest = d.h
 
@@ -155,6 +174,7 @@ ring_clear :: proc(r: ^Event_Ring) {
 	r.tail = 0
 	r.dropped = 0
 	r.digest = FNV_OFFSET
+	r.now = 0
 }
 
 // The event digest as a replay mark carries it.

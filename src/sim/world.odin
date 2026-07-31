@@ -183,6 +183,9 @@ world_bind :: proc(w: ^World, seed: u64) {
 // that do.
 tick :: proc(w: ^World) {
 	w.now += 1
+	// The ring folds this into the digest with every event, so that a replay
+	// mark covers when a line was emitted and not only that it was.
+	w.events.now = w.now
 
 	// Phase 1: lift, in scan order, so same-tick timers stay in schedule order.
 	clear(&w.due)

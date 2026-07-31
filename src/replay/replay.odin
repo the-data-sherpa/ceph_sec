@@ -208,6 +208,50 @@ mark_count :: proc(rep: ^Replay) -> int {
 	return n
 }
 
+// Everything after the first `n` whitespace-delimited fields.
+//
+// Exactly ONE separator character is consumed after the nth field, and the
+// remainder is returned verbatim -- spacing inside a command line is part of the
+// command. Consuming the whole whitespace run instead would make `cmd  ls`
+// parse as `ls`, and that doubled space is deliberately a Bad_Text error,
+// because it is a difference an editor could introduce silently.
+//
+// This exists because the tick and kind are validated out of strings.fields,
+// which splits on ANY whitespace, while the command text used to be recovered
+// with three strings.partition calls against a literal " ". A single tab
+// anywhere in the prefix desynchronised the two: the line validated, the tick
+// read correctly, and the text silently became a different substring. What the
+// player then saw was a divergence report accusing the simulation of a
+// determinism regression -- the parser's mistake, dressed as the one failure
+// this project treats as most serious. A parser for files from strangers has to
+// answer "what did this line say" the same way twice.
+after_fields :: proc(s: string, n: int) -> (rest: string, ok: bool) {
+	is_space :: proc(c: byte) -> bool {
+		return c == ' ' || c == '\t' || c == '\r' || c == '\v' || c == '\f'
+	}
+
+	i := 0
+	for _ in 0 ..< n {
+		for i < len(s) && is_space(s[i]) {
+			i += 1
+		}
+		if i >= len(s) {
+			return "", false
+		}
+		for i < len(s) && !is_space(s[i]) {
+			i += 1
+		}
+	}
+	// The loop above stops at whitespace or at the end, so reaching the end here
+	// means the nth field was last and the remainder is legitimately empty --
+	// `at 13 cmd` is a submitted blank line, which echoes a bare prompt and is a
+	// real entry. Only "there were fewer than n fields" is a parse failure.
+	if i >= len(s) {
+		return "", true
+	}
+	return s[i + 1:], true
+}
+
 // --- what a text field may contain ------------------------------------------
 
 // Whether a command line survives a round trip through the file.

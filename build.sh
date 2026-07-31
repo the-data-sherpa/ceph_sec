@@ -259,13 +259,66 @@ import "core:mem/virtual"'
         *) : ;;
     esac
 
+    # And the exemption list itself, pinned to a literal.
+    #
+    # The two classes above prove that a new package is gated and that the
+    # exempt ones are not. Neither pins WHICH packages are exempt -- so adding
+    # src/sim to GATE_EXEMPT left the whole gate green, exit 0, with the only
+    # signal a shorter package list in a line nobody reads. Measured, on this
+    # commit's parent: exempting src/sim and src/shell together still printed
+    # "purity gate ..... ok".
+    #
+    # That is the same shape as the four bypasses this gate has already grown:
+    # not a rule that was wrong, a rule that stopped covering what it claimed
+    # to. Granting a package I/O is a real decision and it should cost a
+    # deliberate edit in two places, one of which says out loud that the game's
+    # central constraint just moved.
+    if [ "$GATE_EXEMPT" != "src/ui src/save" ]; then
+        echo "  gate self-test FAILED: GATE_EXEMPT is '$GATE_EXEMPT', expected 'src/ui src/save'" >&2
+        echo "    If that change is intended, update this assertion in the same commit" >&2
+        echo "    and say in the message why a package outside the gate needs I/O." >&2
+        rc=1
+    fi
+
+    # Build honesty: `all` must fail when any step fails.
+    #
+    # `all` used to read `do_check && do_test && do_build debug`. POSIX shells
+    # disable errexit inside a function called from a && list, so do_check ran
+    # straight past a failing `odin check`, printed "ok" beside the package that
+    # had just failed, and returned the status of its LAST command instead --
+    # purity_gate, which passes. Measured on the parent commit: `check` exited 1
+    # and `all` exited 0 on the same compiler error.
+    #
+    # Nothing downstream covers this now that check-targets exists. A failing
+    # `odin check -target:windows_amd64` cannot be caught by any later step,
+    # because those targets cannot be linked here at all -- the cross-check IS
+    # the only signal, and it was the one the swallow hid.
+    #
+    # The fix is that `all` uses newline-sequenced commands. That is a fix
+    # anyone could undo while tidying, so it is pinned here rather than trusted.
+    if [ "${CEPHSEC_GATE_CHILD:-0}" != "1" ]; then
+        cat > "$tmp/odin" <<'STUB'
+#!/bin/sh
+case "$1" in
+  check) echo "stub: simulated compiler error" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+STUB
+        chmod +x "$tmp/odin"
+        if CEPHSEC_GATE_CHILD=1 ODIN="$tmp/odin" "$0" all >/dev/null 2>&1; then
+            echo "  gate self-test FAILED: './build.sh all' reported success despite a failing check" >&2
+            echo "    'all' must sequence its steps on separate lines, not with &&." >&2
+            rc=1
+        fi
+    fi
+
     rm -rf "$tmp"
 
     if [ "$rc" -ne 0 ]; then
         echo "GATE SELF-TEST FAILED" >&2
         exit 1
     fi
-    echo "  gate self-test .. ok  (19 classes: 13 rejected, 4 allowed, 2 structural)"
+    echo "  gate self-test .. ok  (21 classes: 13 rejected, 4 allowed, 3 structural, 1 honesty)"
 }
 
 do_check() {

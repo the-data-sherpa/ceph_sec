@@ -278,11 +278,13 @@ parse :: proc(text: string, allocator := context.allocator) -> (rep: Replay, err
 				e.kind = .Cmd
 				// The text is everything after the kind, taken from the line
 				// rather than from the fields, because the spacing inside a
-				// command line is part of it. partition three times: verb, tick,
-				// kind, rest.
-				_, _, after_verb := strings.partition(trimmed, " ")
-				_, _, after_tick := strings.partition(strings.trim_left_space(after_verb), " ")
-				_, _, rest := strings.partition(strings.trim_left_space(after_tick), " ")
+				// command line is part of it. Skips verb, tick and kind using
+				// the same whitespace rule strings.fields used to validate
+				// them -- see after_fields for why that has to match.
+				rest, split_ok := after_fields(trimmed, 3)
+				if !split_ok {
+					return fail(&rep, .Missing_Field, n)
+				}
 				if !text_representable(rest) {
 					return fail(&rep, .Bad_Text, n)
 				}

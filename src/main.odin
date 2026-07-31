@@ -367,6 +367,24 @@ run_replay :: proc(path: string) -> int {
 	}
 	shell.replay_run(&w, &sess, &prog, &rep, &pb)
 
+	// A replay with no marks verifies nothing.
+	//
+	// Playing it end to end proves only that the commands parsed and did not
+	// crash; without a mark there is no committed digest to compare against, so
+	// every possible simulation is a pass. Deleting the mark lines from a corpus
+	// file would leave CI green while testing nothing at all, and the message it
+	// printed -- "reproduced: 1 segment(s), 1 entries, 0 marks verified" -- read
+	// like success. tests/replay_corpus_test.odin already refuses this; the CLI
+	// is what CI and anyone triaging a bug report actually runs, so it has to
+	// refuse it too.
+	if pb.ok && pb.marks_checked == 0 {
+		fmt.eprintfln(
+			"%s played but verified nothing: it carries no marks, so there is no digest to compare against.",
+			path,
+		)
+		return 1
+	}
+
 	if pb.ok {
 		fmt.printfln(
 			"%s reproduced: %d segment(s), %d entries, %d marks verified",

@@ -211,6 +211,34 @@ test_malformed_replays_are_diagnosed :: proc(t: ^testing.T) {
 	}
 }
 
+// A tab between the fields must read the same as a space.
+//
+// The tick and kind are validated with strings.fields, which splits on any
+// whitespace, so `at 3\tcmd ls` passed validation -- but the text was recovered
+// by partitioning on a literal " ", which desynchronised and silently returned
+// a different substring. The entry parsed, and playback then reported a
+// determinism divergence: the parser's error, reported as a simulation bug,
+// which is the most misleading way this could fail.
+//
+// The doubled-space case above must keep failing. It is a difference an editor
+// can introduce invisibly, so it stays an error rather than being absorbed.
+@(test)
+test_a_tab_between_fields_reads_as_a_separator :: proc(t: ^testing.T) {
+	spaced, e1, l1 := replay.parse(HEAD + "segment recon-sweep 1\nat 3 cmd nmap -sV 10.0.4.0/24\n", context.temp_allocator)
+	testing.expectf(t, e1 == .None, "the spaced form should parse, got %v (line %d)", e1, l1)
+	tabbed, e2, l2 := replay.parse(HEAD + "segment recon-sweep 1\nat 3\tcmd nmap -sV 10.0.4.0/24\n", context.temp_allocator)
+	testing.expectf(t, e2 == .None, "the tabbed form should parse, got %v (line %d)", e2, l2)
+
+	testing.expect(t, len(spaced.segments) == 1 && len(tabbed.segments) == 1)
+	testing.expect(t, len(spaced.segments[0].entries) == 1 && len(tabbed.segments[0].entries) == 1)
+
+	want := spaced.segments[0].entries[0].text
+	got := tabbed.segments[0].entries[0].text
+	testing.expectf(t, got == want, "a tab separator changed the command: got %q, expected %q", got, want)
+	testing.expectf(t, got == "nmap -sV 10.0.4.0/24", "the command text was not recovered verbatim: %q", got)
+	testing.expect_value(t, tabbed.segments[0].entries[0].tick, spaced.segments[0].entries[0].tick)
+}
+
 // Too many segments, and a file over the size cap. Both are counted rather than
 // discovered by running out of memory.
 @(test)
