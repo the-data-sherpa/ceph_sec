@@ -257,6 +257,53 @@ app_capture :: proc(app: ^App, path: cstring) {
 	rl.TakeScreenshot(path)
 }
 
+// --- platform diagnostics ---------------------------------------------------
+
+// What app_render's letterbox arithmetic is actually working from, reported
+// rather than acted on.
+//
+// The open question this exists to answer: raylib's GetRenderWidth has an
+// Apple-only branch that multiplies the screen size by GetWindowScaleDPI(),
+// while GetScreenWidth never does. app_render uses GetScreenWidth. On a Retina
+// display that is either correct or off by the backing scale, and which one
+// depends on whether the window was created DPI-aware -- app_init sets only
+// {.WINDOW_RESIZABLE, .VSYNC_HINT}, with FLAG_WINDOW_HIGHDPI deliberately
+// absent, so the framebuffer should be in the same units GetScreenWidth
+// reports and the two should agree.
+//
+// "Should" is the problem. Nobody working on this has a Mac, so switching to
+// the DPI-aware getter to "fix" HiDPI would pair a scaled measurement with an
+// unscaled surface and could manufacture exactly the letterboxing bug it claims
+// to prevent -- on the one platform that cannot be tested here. So the numbers
+// get printed on the --shot line instead, and the first person to run
+// `cephsec --shot 2` on a Retina Mac settles it with data. If render_w equals
+// screen_w there, GetScreenWidth is right and nothing needs to change.
+Metrics :: struct {
+	cell_w, cell_h:       int,
+	virtual_w, virtual_h: int,
+	// GetRenderWidth/Height: the framebuffer, DPI-scaled on Apple platforms.
+	render_w, render_h:   int,
+	// GetScreenWidth/Height: the window, never DPI-scaled. What app_render uses.
+	screen_w, screen_h:   int,
+	dpi_x, dpi_y:         f32,
+}
+
+app_metrics :: proc(app: ^App) -> Metrics {
+	dpi := rl.GetWindowScaleDPI()
+	return Metrics {
+		cell_w    = app.cell_w,
+		cell_h    = app.cell_h,
+		virtual_w = app.virtual_w,
+		virtual_h = app.virtual_h,
+		render_w  = int(rl.GetRenderWidth()),
+		render_h  = int(rl.GetRenderHeight()),
+		screen_w  = int(rl.GetScreenWidth()),
+		screen_h  = int(rl.GetScreenHeight()),
+		dpi_x     = dpi.x,
+		dpi_y     = dpi.y,
+	}
+}
+
 // F1 CRT on/off · F2 flat/curved · F3 cycle theme · F12 screenshot.
 // Present from the first milestone so the render pipeline stays inspectable as
 // it grows.

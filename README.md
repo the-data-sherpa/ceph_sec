@@ -20,9 +20,10 @@ changes.
 
 ## Setup
 
-Requires Odin. Odin drives the system linker through `clang` on Linux, but only
-as a linker *frontend* — `build.sh` falls back to `gcc` via `ODIN_CLANG_PATH`
-when clang is absent, so clang is optional.
+Requires Odin. Odin drives the system linker through `clang` on Linux and macOS,
+but only as a linker *frontend* — `build.sh` falls back to `gcc` via
+`ODIN_CLANG_PATH` when clang is absent, so clang is optional. On Windows Odin
+links through MSVC and never looks for clang, so that check is skipped there.
 
 ```sh
 curl -L -o /tmp/odin.tar.gz \
@@ -32,19 +33,30 @@ ln -sf ~/.local/odin/odin ~/.local/bin/odin
 ```
 
 `vendor:raylib` ships prebuilt inside that release, so there is no raylib build
-step. `build.sh` falls back to `~/.local/odin/odin` if `odin` isn't on `PATH`,
-and honours `ODIN=` if it lives elsewhere.
+step. `build.sh` falls back to `~/.local/odin/odin` (or `odin.exe`) if `odin`
+isn't on `PATH`, and honours `ODIN=` if it lives elsewhere. On Windows, run
+`build.sh` from Git Bash or MSYS2 — it detects the host and appends `.exe` to
+everything it produces.
 
 ## Build
 
 ```sh
-./build.sh check      # type-check every package + enforce sim purity
-./build.sh gate       # purity gate alone (fast; suits a pre-commit hook)
-./build.sh test       # sim test suite
-./build.sh run        # debug build, then launch
-./build.sh release    # optimised build
-./build.sh all        # check + test + build
+./build.sh check          # type-check every package + enforce sim purity
+./build.sh gate           # purity gate alone (fast; suits a pre-commit hook)
+./build.sh check-targets  # type-check src for windows/darwin/linux-arm64
+./build.sh test           # sim test suite
+./build.sh run            # debug build, then launch
+./build.sh release        # optimised build
+./build.sh all            # check + check-targets + test + build
 ```
+
+Odin refuses to cross-*link* (`vendor/raylib/windows/` is empty in a Linux
+release, and it says so), but it will cross-*check* in about 0.2s per target, so
+`check-targets` runs the whole front end for `windows_amd64`, `darwin_amd64`,
+`darwin_arm64` and `linux_arm64` on every build. That catches a platform-
+conditional branch that no longer compiles; it is not a claim the game has been
+run on those platforms. CI builds and links on Linux, macOS and Windows, but
+only Linux actually opens a window and renders a frame.
 
 Progress is saved as each level is completed, so the campaign survives closing
 the game — under `$XDG_DATA_HOME/cephsec` on Linux, `Application Support` on
