@@ -1,20 +1,50 @@
 #!/usr/bin/env bash
 # Ceph.Sec build driver.
 #
-#   ./build.sh check     type-check every package + enforce sim purity
-#   ./build.sh test      run the sim test suite
-#   ./build.sh run       debug build, then launch from the repo root
-#   ./build.sh debug     debug build only
-#   ./build.sh release   optimised build
-#   ./build.sh all       check + test + debug build
+#   ./build.sh check          type-check every package + enforce sim purity
+#   ./build.sh check-targets  type-check src for the platforms we cannot link
+#   ./build.sh test           run the sim test suite
+#   ./build.sh run            debug build, then launch from the repo root
+#   ./build.sh debug          debug build only
+#   ./build.sh release        optimised build
+#   ./build.sh all            check + check-targets + test + debug build
 set -euo pipefail
 
 cd "$(dirname "$0")"
-ODIN="${ODIN:-odin}"
 OUT_DIR="build"
 
+# --- host -------------------------------------------------------------------
+#
+# Everything below that differs between platforms differs because of one of two
+# facts: Windows executables carry an extension, and Windows does not link
+# through clang. Both are decided once, here, rather than sprinkled through the
+# targets.
+case "$(uname -s)" in
+    Linux)                HOST_OS=linux ;;
+    Darwin)               HOST_OS=macos ;;
+    MINGW*|MSYS*|CYGWIN*) HOST_OS=windows ;;
+    *)                    HOST_OS=unknown ;;
+esac
+
+EXE=""
+if [ "$HOST_OS" = windows ]; then
+    EXE=".exe"
+fi
+
+ODIN="${ODIN:-odin}"
 if ! command -v "$ODIN" >/dev/null 2>&1; then
-    if [ -x "$HOME/.local/odin/odin" ]; then
+    # MSYS/Git-bash usually resolves a bare `odin` to odin.exe, but that is a
+    # property of the shell rather than something to rely on; probe explicitly
+    # before falling back to the location README.md installs into. The `.exe`
+    # candidate is tried on every host, not just a detected Windows one, so a
+    # shell that reports an unrecognised uname still finds a working compiler.
+    if command -v "$ODIN.exe" >/dev/null 2>&1; then
+        ODIN="$ODIN.exe"
+    elif [ -x "$HOME/.local/odin/odin$EXE" ]; then
+        ODIN="$HOME/.local/odin/odin$EXE"
+    elif [ -x "$HOME/.local/odin/odin.exe" ]; then
+        ODIN="$HOME/.local/odin/odin.exe"
+    elif [ -x "$HOME/.local/odin/odin" ]; then
         ODIN="$HOME/.local/odin/odin"
     else
         echo "error: 'odin' not found on PATH. See README.md for setup." >&2
@@ -22,15 +52,23 @@ if ! command -v "$ODIN" >/dev/null 2>&1; then
     fi
 fi
 
-# Odin drives the system linker through clang on Linux. clang is not actually
-# required for that job -- it is invoked as a linker frontend, and gcc accepts
-# the same flags -- so fall back rather than making clang a hard dependency.
-if [ -z "${ODIN_CLANG_PATH:-}" ] && ! command -v clang >/dev/null 2>&1; then
-    if command -v gcc >/dev/null 2>&1; then
-        export ODIN_CLANG_PATH=gcc
-    else
-        echo "error: neither clang nor gcc found; Odin needs one to link." >&2
-        exit 1
+# Odin drives the system linker through clang on Linux and macOS. clang is not
+# actually required for that job -- it is invoked as a linker frontend, and gcc
+# accepts the same flags -- so fall back rather than making clang a hard
+# dependency.
+#
+# Windows is excluded deliberately, and the exclusion is the whole point of the
+# branch: there Odin drives link.exe (or lld) and never looks for clang, so a
+# Windows host with neither clang nor gcc installed is entirely normal. Running
+# this check there would have failed the build on a perfectly good toolchain.
+if [ "$HOST_OS" != windows ]; then
+    if [ -z "${ODIN_CLANG_PATH:-}" ] && ! command -v clang >/dev/null 2>&1; then
+        if command -v gcc >/dev/null 2>&1; then
+            export ODIN_CLANG_PATH=gcc
+        else
+            echo "error: neither clang nor gcc found; Odin needs one to link." >&2
+            exit 1
+        fi
     fi
 fi
 
@@ -231,30 +269,99 @@ do_check() {
     purity_gate
 }
 
+# The platforms this project claims to support but cannot produce a binary for
+# from here.
+#
+# Cross-LINKING is refused outright: `odin build -target:windows_amd64` prints
+# "Linking for cross compilation for this platform is not yet supported" -- and
+# exits 0 while doing so, which is its own trap -- and a Linux Odin release
+# ships an empty vendor/raylib/windows/, so there is nothing to link against
+# either. Cross-CHECKING is a different matter: it runs the entire front end
+# with the target's ODIN_OS and ODIN_ARCH, so every `when ODIN_OS ==` branch and
+# every platform-sized type is compiled for real. It costs ~0.2s per target.
+#
+# That is not proof the game runs on a Mac. It is proof that the code someone
+# will build on a Mac still type-checks, caught on this machine instead of in
+# their terminal -- and it is the only cross-platform verification available
+# without the hardware, so it runs every time rather than on request.
+CHECK_TARGETS="windows_amd64 darwin_amd64 darwin_arm64 linux_arm64"
+
+do_check_targets() {
+    echo "cross-checking src:"
+    local t
+    for t in $CHECK_TARGETS; do
+        "$ODIN" check src -target:"$t"
+        printf '  %-14s .. ok\n' "$t"
+    done
+}
+
 do_test() {
     mkdir -p "$OUT_DIR"
-    "$ODIN" test tests -out:"$OUT_DIR/sim_tests"
+    "$ODIN" test tests -out:"$OUT_DIR/sim_tests$EXE"
 }
 
 do_build() {
     mkdir -p "$OUT_DIR"
     case "$1" in
-        release) "$ODIN" build src -out:"$OUT_DIR/cephsec" -o:speed -no-bounds-check ;;
-        *)       "$ODIN" build src -out:"$OUT_DIR/cephsec" -debug ;;
+        # -no-bounds-check is deliberately absent. It was here for speed that a
+        # text-mode game at 60Hz does not need, and the binary now parses files
+        # it did not write -- a save file, and soon more. An out-of-bounds index
+        # on untrusted input should be a panic with a line number, not a silent
+        # read of whatever was next in memory. -o:speed stays.
+        release) "$ODIN" build src -out:"$OUT_DIR/cephsec$EXE" -o:speed ;;
+        *)       "$ODIN" build src -out:"$OUT_DIR/cephsec$EXE" -debug ;;
     esac
-    echo "built $OUT_DIR/cephsec ($1)"
+    echo "built $OUT_DIR/cephsec$EXE ($1)"
 }
 
+# The stages below are sequenced by newline, never by `&&`, and that is not a
+# style choice.
+#
+# `all) do_check && do_test` reads like it stops at the first failure. It does
+# the opposite: bash suspends errexit for every command inside a function called
+# from a && list, so a compiler error -- or a segfault -- inside do_check was
+# swallowed, do_check returned the status of its last echo, and `./build.sh all`
+# exited 0 on source that does not compile. `./build.sh check` was correct the
+# whole time, which is why this survived: the one command a person actually
+# types before pushing was the one that lied.
+#
+# As plain statements, errexit applies normally and the first failure stops the
+# build.
 case "${1:-all}" in
-    check)   do_check ;;
+    check)
+        do_check
+        ;;
     # Standalone so it can run as a fast pre-commit hook, and so the gate itself
     # is testable without a compiler in the loop.
-    gate)    gate_selftest && purity_gate ;;
-    test)    do_test ;;
-    debug)   do_build debug ;;
-    release) do_build release ;;
+    gate)
+        gate_selftest
+        purity_gate
+        ;;
+    check-targets)
+        do_check_targets
+        ;;
+    test)
+        do_test
+        ;;
+    debug)
+        do_build debug
+        ;;
+    release)
+        do_build release
+        ;;
     # The binary embeds its own assets, so this is only convenience.
-    run)     do_build debug && ./"$OUT_DIR/cephsec" ;;
-    all)     do_check && do_test && do_build debug ;;
-    *)       echo "usage: $0 {check|gate|test|run|debug|release|all}" >&2; exit 2 ;;
+    run)
+        do_build debug
+        ./"$OUT_DIR/cephsec$EXE"
+        ;;
+    all)
+        do_check
+        do_check_targets
+        do_test
+        do_build debug
+        ;;
+    *)
+        echo "usage: $0 {check|gate|check-targets|test|run|debug|release|all}" >&2
+        exit 2
+        ;;
 esac

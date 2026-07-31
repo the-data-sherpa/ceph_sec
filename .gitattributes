@@ -1,0 +1,16 @@
+# Line endings are normalised in the repository and checked out as LF on every
+# platform, including Windows.
+#
+# This is not tidiness. Git for Windows installs with core.autocrlf=true by
+# default, so without this file a Windows clone rewrites build.sh with CRLF
+# endings, bash reads the shebang as `#!/usr/bin/env bash\r`, and the build dies
+# looking for an interpreter named "bash\r" -- before the compiler is ever
+# reached, with an error that names neither the file nor the cause.
+#
+# The shader matters for a second reason: crt.fs is #load'ed into the binary as
+# a string literal, so its bytes are part of the program rather than an input to
+# it. A CRLF checkout would change what the compiler embeds.
+*.sh    text eol=lf
+*.odin  text eol=lf
+*.fs    text eol=lf
+*.yml   text eol=lf

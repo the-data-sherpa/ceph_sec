@@ -198,7 +198,22 @@ main :: proc() {
 
 		if opts.shot.enabled && w.now >= opts.shot.at {
 			ui.app_capture(&app, opts.shot.path)
-			fmt.printfln("wrote %s at tick %d", opts.shot.path, u64(w.now))
+			// The metrics ride along on this line because --shot is the only
+			// way to get a window opened, measured and closed on a machine
+			// nobody here owns: run it on a Retina Mac or a scaled Windows
+			// display and paste the output. See ui.Metrics for what the numbers
+			// are meant to settle.
+			m := ui.app_metrics(&app)
+			fmt.printfln(
+				"wrote %s at tick %d | cell %dx%d virtual %dx%d render %dx%d screen %dx%d dpi %.2fx%.2f",
+				opts.shot.path,
+				u64(w.now),
+				m.cell_w, m.cell_h,
+				m.virtual_w, m.virtual_h,
+				m.render_w, m.render_h,
+				m.screen_w, m.screen_h,
+				m.dpi_x, m.dpi_y,
+			)
 			break
 		}
 
