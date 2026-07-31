@@ -55,10 +55,25 @@ Crt :: struct {
 	loc_flicker:    i32,
 }
 
-crt_load :: proc(path: cstring, params := CRT_DEFAULT) -> Crt {
+// The shader source, compiled into the binary.
+//
+// Loading it from disk made the game silently worse when run from anywhere but
+// the repository root: raylib fell back to its default shader, and what you got
+// was a flat terminal that looked like it was meant to be flat. Nobody noticed
+// for three milestones. Embedding removes the failure mode rather than
+// diagnosing it -- there is no path to get wrong, and no way to ship the binary
+// without its own appearance.
+// The NUL is not decorative. #load hands back the file's bytes verbatim, and a
+// GLSL source file does not end in one -- so casting straight to cstring would
+// have raylib read past the end of the constant. Appending it at compile time
+// costs a byte and removes the question.
+CRT_SOURCE :: #load("../../assets/shaders/crt.fs", string) + "\x00"
+
+crt_load :: proc(params := CRT_DEFAULT) -> Crt {
 	c: Crt
 	c.params = params
-	c.shader = rl.LoadShader(nil, path) // nil vertex shader = raylib's default
+	// nil vertex shader = raylib's default.
+	c.shader = rl.LoadShaderFromMemory(nil, cstring(raw_data(CRT_SOURCE)))
 
 	// raylib hands back a non-zero fallback id on failure, so probe a uniform we
 	// know the real shader declares instead of trusting the id alone.

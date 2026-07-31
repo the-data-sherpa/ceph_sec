@@ -162,7 +162,7 @@ cmd_play :: proc(s: ^Session, cmd: ^Command) {
 	}
 
 	s.pending_transition = Transition {
-		level = target.number,
+		level = target.id,
 	}
 }
 
@@ -172,7 +172,7 @@ cmd_retry :: proc(s: ^Session, cmd: ^Command) {
 		return
 	}
 	s.pending_transition = Transition {
-		level = s.level.number,
+		level = s.level.id,
 		retry = true,
 	}
 }

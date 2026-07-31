@@ -307,6 +307,47 @@ test_every_level_has_its_teaching_content :: proc(t: ^testing.T) {
 	}
 }
 
+// The hint system exists so a brief can state the goal without handing over the
+// command. That only works if the briefs actually withhold it -- and two of the
+// five did not, for a whole commit, while the commit message claimed otherwise.
+// Nothing noticed, because nothing was looking.
+//
+// A brief may name a tool ("nmap will do this"). What it may not contain is a
+// line a player could paste: a tool name followed by a target.
+@(test)
+test_no_brief_gives_away_the_command :: proc(t: ^testing.T) {
+	looks_like_a_target :: proc(s: string) -> bool {
+		// An address, a CIDR, a URL or a user@host -- the things that turn a
+		// tool's name into an invocation.
+		return strings.contains(s, "://") ||
+			strings.contains(s, "@") ||
+			(strings.count(s, ".") >= 3 && strings.contains_any(s, "0123456789"))
+	}
+
+	for &l in campaign.LEVELS {
+		for line in l.brief {
+			for spec in shell.COMMANDS {
+				if !spec.job {
+					continue // builtins are not the answer to anything
+				}
+				name_at := strings.index(line, spec.name)
+				if name_at < 0 {
+					continue
+				}
+				rest := line[name_at + len(spec.name):]
+				testing.expectf(
+					t,
+					!looks_like_a_target(rest),
+					"level %d (%s) brief hands over the command -- that is what `hint` is for: %q",
+					l.number,
+					l.id,
+					line,
+				)
+			}
+		}
+	}
+}
+
 // --- hints ------------------------------------------------------------------
 
 // Note: "every objective has its own hint" is deliberately NOT the rule. Level

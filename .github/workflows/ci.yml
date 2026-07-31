@@ -1,0 +1,277 @@
+name: ci
+
+# Everything here was previously verified by one person, on one machine, by
+# remembering to type it. The purity gate especially: it is the mechanism behind
+# this project's central claim, and until now it ran only when asked. Four
+# bypasses had accumulated in it unnoticed.
+on:
+  push:
+    branches: [main, dev, "m*", "infra*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ODIN_VERSION: dev-2026-07a
+
+jobs:
+  # Runs first and alone, because it needs no compiler and no toolchain: it is
+  # pure shell over the source text. A gate violation should be reported in
+  # seconds rather than after a full build, and the gate self-test means this
+  # job also proves the gate can still catch what it claims to.
+  #
+  # Linux-only on purpose. The gate is grep over files that .gitattributes
+  # guarantees are byte-identical on every platform, so running it three times
+  # would prove nothing about the gate and cost three runners. (`build.sh check`
+  # runs it again inside the matrix anyway, which is where a BSD-vs-GNU grep
+  # difference would actually show up.)
+  gate:
+    name: purity gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gate self-test and scan
+        run: ./build.sh gate
+
+  # The three platforms the game claims to support, each compiling and running
+  # its own tests with its own toolchain. `check-targets` inside this job then
+  # covers the two architectures no runner exists for -- darwin_arm64 from an
+  # x86 Linux box, linux_arm64 from a Mac -- so every target in the support
+  # claim is at least type-checked somewhere.
+  build-and-test:
+    name: build and test (${{ matrix.os }})
+    needs: gate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # A macOS-only or Windows-only break is exactly the failure this matrix
+      # exists to surface, and cancelling the other legs would hide whether it
+      # is platform-specific or general.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            slug: linux-amd64
+          - os: macos-latest # arm64 since macos-14
+            slug: macos-arm64
+          - os: windows-latest
+            slug: windows-amd64
+
+    # Git bash on the Windows runner, bash everywhere else, so build.sh is
+    # driven identically on all three. Invoked as `bash ./build.sh` rather than
+    # `./build.sh` because a Windows checkout does not carry a POSIX execute
+    # bit.
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain is a ~65MB tarball (~145MB zip on Windows) and the release
+      # is immutable, so the cache key is version plus platform. A cold run costs
+      # the download; every other run costs nothing.
+      - name: Cache Odin
+        id: cache-odin
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/odin
+          key: odin-${{ env.ODIN_VERSION }}-${{ matrix.slug }}
+
+      # Both archives nest their contents one level down -- a versioned
+      # directory in the tarballs, a literal `dist/` in the zip -- and build.sh
+      # looks for ~/.local/odin/odin, so both are flattened by exactly one level.
+      - name: Install Odin (Unix)
+        if: runner.os != 'Windows' && steps.cache-odin.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.local/odin
+          asset="odin-${{ matrix.slug }}-${ODIN_VERSION}.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/odin.tar.gz" \
+            "https://github.com/odin-lang/Odin/releases/download/${ODIN_VERSION}/${asset}"
+          tar -xzf "$RUNNER_TEMP/odin.tar.gz" --strip-components=1 -C ~/.local/odin
+          chmod +x ~/.local/odin/odin
+
+      - name: Install Odin (Windows)
+        if: runner.os == 'Windows' && steps.cache-odin.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ver  = $env:ODIN_VERSION
+          $url  = "https://github.com/odin-lang/Odin/releases/download/$ver/odin-windows-amd64-$ver.zip"
+          $zip  = Join-Path $env:RUNNER_TEMP "odin.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $stage = Join-Path $env:RUNNER_TEMP "odin-stage"
+          Expand-Archive -Path $zip -DestinationPath $stage -Force
+          $dest = Join-Path $env:USERPROFILE ".local\odin"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item -Path (Join-Path $stage "dist\*") -Destination $dest -Recurse -Force
+
+      - name: Report toolchain
+        run: |
+          set -euo pipefail
+          uname -s
+          # Named explicitly rather than globbed: the Windows archive puts
+          # LLVM-C.dll beside odin.exe, and both have to end up in the same
+          # directory for the compiler to start at all.
+          if [ "$RUNNER_OS" = Windows ]; then
+            ~/.local/odin/odin.exe version
+          else
+            ~/.local/odin/odin version
+          fi
+          # build.sh falls back to gcc via ODIN_CLANG_PATH when clang is absent,
+          # and skips that check entirely on Windows, where Odin drives link.exe
+          # and never looks for clang. Report what CI picked so a linker-specific
+          # failure is not a mystery.
+          if [ "$RUNNER_OS" = Windows ]; then
+            echo "Windows: Odin links through MSVC; clang is not consulted"
+          else
+            command -v clang >/dev/null && clang --version | head -1 || echo "clang absent -- build.sh will use gcc"
+          fi
+
+      - name: Check every package
+        run: bash ./build.sh check
+
+      # ~0.2s per target and no linker involved, so this runs on every leg of
+      # the matrix even though it is host-independent. The redundancy is free
+      # and it means a broken `when ODIN_OS ==` branch is reported by whichever
+      # leg finishes first.
+      - name: Cross-check the targets we cannot link
+        run: bash ./build.sh check-targets
+
+      # The suites are headless: nothing here opens a window. Only the game
+      # binary calls InitWindow, and this job never runs it.
+      - name: Test
+        run: bash ./build.sh test
+
+      # Runs on all three because this is the step that links raylib, and a
+      # missing framework or an unresolved symbol is precisely the sort of
+      # portability break that only appears at link time. It needs a toolchain,
+      # not a display, so it is safe on a headless runner.
+      #
+      # raylib links against X11 and GL, and the ubuntu runner ships neither set
+      # of development libraries -- `cannot find -lX11`. These are link-time
+      # dependencies only; the test suites above need none of them, which is why
+      # 204 tests pass on a runner that cannot yet produce a binary. macOS links
+      # its own frameworks and Windows the vendored .lib, so neither needs this.
+      - name: Install X11 and GL headers (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libgl1-mesa-dev
+
+      - name: Release build
+        run: bash ./build.sh release
+
+      # The regression corpus, played through the shipping binary rather than
+      # through the test harness.
+      #
+      # `odin test` already plays these -- see tests/replay_corpus_test.odin --
+      # but through the debug build and the test allocator. Playing them through
+      # the optimised binary is what catches a divergence that only exists under
+      # -o:speed, which is the build a player actually runs.
+      #
+      # This sits in the matrix rather than in `smoke` deliberately: it is
+      # headless, so it costs nothing to run everywhere, and "the same replay
+      # reproduces bit-for-bit on Linux, macOS and Windows" is the strongest
+      # determinism claim this project can make. It is also the one claim nobody
+      # here can check by hand -- there is no Mac and no Windows box in reach.
+      - name: Replay the regression corpus
+        run: |
+          set -euo pipefail
+          bin=build/cephsec
+          [ "$RUNNER_OS" = Windows ] && bin=build/cephsec.exe
+          for f in tests/replays/*.replay; do
+            "./$bin" --replay "$f"
+          done
+
+  # A binary that only works from the repository root is one nobody else can
+  # run -- and for three milestones this one silently lost its shader when
+  # moved, which looked like a design choice rather than a bug. Copying it
+  # somewhere empty and rendering a real frame is what stops that returning.
+  #
+  # LINUX-ONLY, AND THAT IS A KNOWN GAP, NOT AN OVERSIGHT. This is the only step
+  # that opens a window and compiles a GLSL shader, so it needs a working GL
+  # 3.3 context. On Linux that is xvfb plus Mesa's software rasteriser, which is
+  # reliable. The macOS and Windows runners are a different question: neither is
+  # guaranteed a usable window server or an OpenGL implementation past 1.1, and
+  # nobody here can test that. Shipping a step that fails on someone else's
+  # machine for reasons unrelated to the code would make CI a thing to ignore.
+  #
+  # So: the matrix above proves the game compiles, tests and *links* on all
+  # three platforms. Whether it renders is proved on Linux only. Nobody has yet
+  # run this binary on a Mac or a Windows box -- when someone does, `cephsec
+  # --shot 2 frame.png` prints its display metrics, and this step can grow.
+  smoke:
+    name: relocated binary renders (linux only)
+    # `needs: gate`, NOT `needs: build-and-test`. This is the only job that
+    # opens a window, compiles the CRT shader and renders a frame -- the check
+    # that caught the binary silently losing its shader for three milestones.
+    # `needs` waits for the whole matrix, and the macOS and Windows legs have
+    # never run, so hanging this off build-and-test would let one red leg on an
+    # untested platform silently skip the rendering check. It re-installs Odin
+    # and rebuilds release itself, so it has no data dependency on the matrix.
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Odin
+        id: cache-odin
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/odin
+          key: odin-${{ env.ODIN_VERSION }}-linux-amd64
+
+      - name: Install Odin
+        if: steps.cache-odin.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.local/odin
+          curl -fsSL -o "$RUNNER_TEMP/odin.tar.gz" \
+            "https://github.com/odin-lang/Odin/releases/download/${ODIN_VERSION}/odin-linux-amd64-${ODIN_VERSION}.tar.gz"
+          tar -xzf "$RUNNER_TEMP/odin.tar.gz" --strip-components=1 -C ~/.local/odin
+          chmod +x ~/.local/odin/odin
+
+      # xvfb for the display, and the X11/GL development libraries because this
+      # job builds the binary itself rather than taking one from the matrix --
+      # raylib will not link without them.
+      - name: Install X11, GL and xvfb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libgl1-mesa-dev xvfb
+
+      - name: Release build
+        run: ./build.sh release
+
+      - name: Smoke-test the binary outside the repo
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/relocated && cp build/cephsec /tmp/relocated/
+          cd /tmp/relocated
+          # --shot runs to a fixed sim tick, writes a PNG and exits. It
+          # exercises window creation, shader compilation and the whole render
+          # path -- so it fails if the binary cannot stand on its own. The line
+          # it prints also carries the cell/virtual/render/screen/dpi metrics,
+          # which is the Linux baseline the macOS question gets compared against.
+          xvfb-run -a ./cephsec --shot 2 frame.png 2>err.log | tee shot.log
+          test -s frame.png || { echo "no frame rendered"; cat err.log; exit 1; }
+          # The shader is compiled in, so any complaint about it is now a real
+          # failure rather than a missing file.
+          if grep -qi "shader" err.log; then
+            echo "the CRT shader did not load in a relocated binary:"; cat err.log; exit 1
+          fi
+          echo "rendered $(stat -c%s frame.png) bytes with the shader intact"
+
+      - name: Upload the smoke-test frame
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-frame
+          path: /tmp/relocated/frame.png
+          if-no-files-found: ignore

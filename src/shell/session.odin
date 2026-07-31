@@ -56,12 +56,31 @@ Session :: struct {
 	// transition frees the arena this session's own strings live in, so `main`
 	// carries it out between frames. Same shape as a job's pending move.
 	pending_transition: Maybe(Transition),
+
+	// Latched the tick the level's last required objective falls, so the debrief
+	// fires once. Lives here rather than in main because the headless replay
+	// driver needs the same edge, and two copies of "have we finished yet" would
+	// be two chances to disagree about the tick it happened on.
+	level_done: bool,
+
+	// Where a recording is being written, or nil. Owned by main -- deliberately
+	// not allocated out of the run arena, which world_reset frees under it at
+	// every level transition.
+	journal: ^Journal,
 }
 
 // A requested level change. `retry` distinguishes restarting the current level
 // from moving to another, which only matters for what gets said about it.
+//
+// The level is carried as an *id*, not as the display number the player typed.
+// A number is a position in a list, and the list is going to be renumbered --
+// inserting a level between two blocks is the most ordinary content edit there
+// is, and there are ~55 more levels to come. Carrying the number would make a
+// recorded replay transition to whatever now sits at that position, silently,
+// with no digest wrong until several ticks later. cmd_play resolves the number
+// to a ^Level and stores its id; main resolves the id back with level_by_id.
 Transition :: struct {
-	level: int,
+	level: string, // level id
 	retry: bool,
 }
 
@@ -83,7 +102,11 @@ session_init :: proc(s: ^Session, w: ^sim.World, host: sim.Handle(sim.Host), use
 	s.charge_count = 0
 	s.hints_shown = 0
 	s.hinted_kill = false
+	s.level_done = false
+	s.pending_transition = nil
 	line_init(&s.line, w.allocator)
+	// `journal` is not cleared: it belongs to main and spans the whole recording,
+	// across every level the player passes through.
 }
 
 home_dir :: proc(user: string, allocator := context.allocator) -> string {
@@ -245,7 +268,13 @@ session_input :: proc(s: ^Session, ev: input.Event) -> bool {
 
 // ^C targets the foreground job only, exactly as bash does. Background jobs die
 // by `kill`.
+//
+// This is the thing `--exec` cannot express at all: there is no command line
+// that means "interrupt". A replay records it as its own kind of entry, which is
+// half the reason the format has kinds rather than just command lines.
 session_interrupt :: proc(s: ^Session) {
+	journal_record(s, .Intr, "")
+
 	if j, ok := foreground(s); ok && job_live(s, j) {
 		label := j.label
 		cancelled := job_kill(s, j)
@@ -273,6 +302,27 @@ session_interrupt :: proc(s: ^Session) {
 
 session_submit :: proc(s: ^Session) {
 	text := line_text(&s.line, context.temp_allocator)
+	session_submit_text(s, text)
+	line_clear(&s.line)
+}
+
+// Everything pressing Enter does, given the line: echo it, remember it, record
+// it, run it.
+//
+// Separate from session_submit because it is the seam a replay needs. The echo
+// is an *event*, so it is part of what a mark digests; a replay that fed
+// commands straight to session_exec would reproduce the world and not the
+// transcript, and would then report a divergence on its first mark. Recording
+// and playback therefore both go through here, and so does main's `--exec`, so
+// that all three produce the same event stream from the same command.
+//
+// The text is trimmed once, at the top, and the trimmed form is what is echoed,
+// remembered, recorded and run. Trailing whitespace on a command line is
+// invisible in a terminal and is exactly what an editor strips out of a replay
+// file, so a format that depended on it would break the first time someone
+// tidied one up in a pull request.
+session_submit_text :: proc(s: ^Session, raw: string) {
+	text := strings.trim_space(raw)
 
 	// Echo the command into the scrollback exactly as a terminal does, so the
 	// transcript reads back as a session rather than as bare output.
@@ -283,9 +333,13 @@ session_submit :: proc(s: ^Session) {
 	)
 
 	line_history_push(&s.line, text, s.world.allocator)
-	line_clear(&s.line)
 
-	if len(strings.trim_space(text)) == 0 {
+	// Recorded before dispatch, and recorded even when blank: the echo above is
+	// an event, so a blank line the player submitted is something playback has to
+	// do too.
+	journal_record(s, .Cmd, text)
+
+	if len(text) == 0 {
 		return
 	}
 	session_exec(s, text)
