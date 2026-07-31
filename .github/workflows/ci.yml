@@ -77,6 +77,23 @@ jobs:
       - name: Release build
         run: ./build.sh release
 
+      # The regression corpus, played through the shipping binary rather than
+      # through the test harness.
+      #
+      # `odin test` already plays these -- see tests/replay_corpus_test.odin --
+      # but through the debug build and the test allocator. Playing them through
+      # the optimised binary is what catches a divergence that only exists under
+      # -o:speed -no-bounds-check, which is precisely the build a player runs and
+      # the one no test has ever exercised.
+      #
+      # Headless: --replay opens no window, so this needs no display.
+      - name: Replay the regression corpus
+        run: |
+          set -euo pipefail
+          for f in tests/replays/*.replay; do
+            ./build/cephsec --replay "$f"
+          done
+
       # A binary that only works from the repository root is one nobody else can
       # run -- and for three milestones this one silently lost its shader when
       # moved, which looked like a design choice rather than a bug. Copying it

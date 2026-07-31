@@ -110,9 +110,25 @@ Event_Ring :: struct {
 	head:    u64, // total ever pushed
 	tail:    u64, // total ever drained
 	dropped: u64,
+
+	// A running digest of every event ever pushed, in push order.
+	//
+	// Folded on push rather than on drain, and that is the whole point. The ring
+	// is deliberately lossy, and draining is a frame-timed concern -- a digest
+	// accumulated by whoever happens to be reading would change if a frontend
+	// stalled long enough to drop a line. Folded here it is a pure function of
+	// what the simulation said, which is what a replay mark needs it to be.
+	//
+	// Zero on a bare Event_Ring rather than FNV_OFFSET; ring_clear seeds it, and
+	// every World gets one through world_bind.
+	digest: u64,
 }
 
 ring_push :: proc(r: ^Event_Ring, e: Event) {
+	d := Digest{h = r.digest}
+	digest_event(&d, e)
+	r.digest = d.h
+
 	r.buf[r.head % EVENT_RING_CAP] = e
 	r.head += 1
 	if r.head - r.tail > EVENT_RING_CAP {
@@ -138,4 +154,10 @@ ring_clear :: proc(r: ^Event_Ring) {
 	r.head = 0
 	r.tail = 0
 	r.dropped = 0
+	r.digest = FNV_OFFSET
+}
+
+// The event digest as a replay mark carries it.
+events_digest :: proc(w: ^World) -> u64 {
+	return w.events.digest
 }

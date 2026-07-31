@@ -200,13 +200,34 @@ import "core:strings"'
     must_accept "core:mem/virtual"    'package probe
 import "core:mem/virtual"'
 
+    # The structural half of the gate: which directories are inside it at all.
+    #
+    # Everything above tests what a gated package may contain. Neither of these
+    # did, and deny-by-default is the rule most likely to be quietly lost --
+    # rewriting gate_packages as an explicit list is a one-line change that looks
+    # like tidying. This milestone added src/replay, a hand-written parser for
+    # files from strangers, which is exactly the package you would least like to
+    # find outside the gate. It is inside it because every directory is, and this
+    # is what proves that rather than restating it.
+    mkdir -p "$tmp/src/brand_new" "$tmp/src/ui" "$tmp/src/save"
+    listed=" $( (cd "$tmp" && gate_packages) | tr '\n' ' ') "
+    case "$listed" in
+        *" src/brand_new "*) : ;;
+        *) echo "  gate self-test FAILED: a newly added package was not gated" >&2; rc=1 ;;
+    esac
+    case "$listed" in
+        *" src/ui "*|*" src/save "*)
+            echo "  gate self-test FAILED: an exempt package was gated anyway" >&2; rc=1 ;;
+        *) : ;;
+    esac
+
     rm -rf "$tmp"
 
     if [ "$rc" -ne 0 ]; then
         echo "GATE SELF-TEST FAILED" >&2
         exit 1
     fi
-    echo "  gate self-test .. ok  (17 classes: 13 rejected, 4 allowed)"
+    echo "  gate self-test .. ok  (19 classes: 13 rejected, 4 allowed, 2 structural)"
 }
 
 do_check() {
@@ -217,6 +238,8 @@ do_check() {
     echo "  src/sim ......... ok"
     "$ODIN" check src/campaign -no-entry-point
     echo "  src/campaign .... ok"
+    "$ODIN" check src/replay -no-entry-point
+    echo "  src/replay ...... ok"
     "$ODIN" check src/shell -no-entry-point
     echo "  src/shell ....... ok"
     "$ODIN" check src/save -no-entry-point

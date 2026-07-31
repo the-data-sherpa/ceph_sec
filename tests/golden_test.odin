@@ -29,119 +29,17 @@ import "../src/sim"
 // must never be is updated reflexively, because the same failure is what a real
 // determinism regression looks like.
 
-// FNV-1a, 64-bit. Hand-rolled for the same reason PCG32 is: a digest committed
-// to the repository has to mean the same thing in five years, and a hash from a
-// library is free to change representation between releases.
-@(private)
-FNV_OFFSET :: 0xcbf29ce484222325
-@(private)
-FNV_PRIME :: 0x100000001b3
-
-@(private)
-Digest :: struct {
-	h: u64,
-}
-
-@(private)
-digest_init :: proc() -> Digest {
-	return Digest{h = FNV_OFFSET}
-}
-
-@(private)
-digest_bytes :: proc(d: ^Digest, data: []byte) {
-	for b in data {
-		d.h ~= u64(b)
-		d.h *= FNV_PRIME
-	}
-}
-
-@(private)
-digest_str :: proc(d: ^Digest, s: string) {
-	digest_bytes(d, transmute([]byte)s)
-	digest_bytes(d, {0}) // separator, so "ab"+"c" and "a"+"bc" differ
-}
-
-@(private)
-digest_u64 :: proc(d: ^Digest, v: u64) {
-	buf: [8]byte
-	x := v
-	for i in 0 ..< 8 {
-		buf[i] = byte(x & 0xff)
-		x >>= 8
-	}
-	digest_bytes(d, buf[:])
-}
-
-@(private)
-digest_i64 :: proc(d: ^Digest, v: i64) {
-	digest_u64(d, u64(v))
-}
-
-// Everything observable about a world, in a fixed order.
+// The digest itself lives in `src/sim`, not here.
 //
-// Iteration is by pool slot throughout, which is the same order the simulation
-// itself uses -- a digest that walked a map would hash differently run to run
-// and prove nothing.
-@(private)
-digest_world :: proc(w: ^sim.World, d: ^Digest) {
-	digest_u64(d, w.seed)
-	digest_u64(d, u64(w.now))
-	digest_u64(d, w.rng.state)
-	digest_u64(d, w.rng.inc)
-	digest_u64(d, u64(w.tag_counter))
-
-	digest_i64(d, i64(w.trace.level))
-	digest_i64(d, w.trace.accum)
-	digest_u64(d, u64(transmute(u8)w.trace.responses))
-	digest_u64(d, u64(w.run.state))
-	digest_u64(d, u64(w.run.ended_at))
-
-	it: int
-	for sn in sim.pool_iter(&w.subnets, &it) {
-		digest_str(d, sn.name)
-		digest_u64(d, u64(sn.monitoring))
-		digest_i64(d, i64(sn.suspicion))
-		digest_u64(d, u64(sn.hot_ticks))
-		digest_u64(d, sn.alarmed ? 1 : 0)
-	}
-
-	ith: int
-	for host in sim.pool_iter(&w.hosts, &ith) {
-		digest_str(d, host.hostname)
-		digest_u64(d, u64(host.address))
-		digest_u64(d, u64(host.access))
-		digest_u64(d, u64(host.access_at))
-		digest_u64(d, host.discovered ? 1 : 0)
-		for svc in host.services {
-			digest_u64(d, u64(svc.port))
-			digest_u64(d, svc.discovered ? 1 : 0)
-		}
-		for f in host.files {
-			digest_str(d, f.path)
-			digest_u64(d, f.found ? 1 : 0)
-		}
-		for a in host.accounts {
-			digest_str(d, a.username)
-			digest_str(d, a.password) // the 50% response rewrites these
-		}
-	}
-
-	for c in w.keyring {
-		digest_str(d, c.username)
-		digest_str(d, c.password)
-	}
-
-	// The noise log carries what was charged and by which command.
-	for i in 0 ..< w.noise_log.count {
-		r, ok := sim.noise_log_at(w, i)
-		if !ok {
-			continue
-		}
-		digest_u64(d, u64(r.at))
-		digest_i64(d, i64(r.applied))
-		digest_str(d, r.source)
-	}
-}
+// It used to live in this file, and a second copy grew in the replay code the
+// moment marks needed one -- two hand-rolled FNV-1a implementations, each free
+// to drift, both claiming to pin the same behaviour. There is now exactly one:
+// sim.digest_* and sim.digest_world, inside the purity gate, hand-rolled for the
+// same reason PCG32 is. The byte sequence it produces is what the three literals
+// below pin, so moving it was only safe because it moved verbatim.
+//
+// It is referenced as sim.digest_* below rather than aliased here, so nothing in
+// this file can quietly become a second implementation again.
 
 // Runs a scripted session against a level and digests both the world and every
 // line the player would have seen, including which job produced it.
@@ -178,17 +76,17 @@ golden_run :: proc(level_id: string, script: []string, extra_ticks: int) -> u64 
 		}
 	}
 
-	d := digest_init()
+	d := sim.digest_init()
 
-	drain :: proc(w: ^sim.World, d: ^Digest) {
+	drain :: proc(w: ^sim.World, d: ^sim.Digest) {
 		for {
 			e, ok := sim.ring_pop(&w.events)
 			if !ok {
 				break
 			}
 			if l, is_log := e.(sim.Ev_Log); is_log {
-				digest_str(d, l.text)
-				digest_u64(d, u64(l.job))
+				sim.digest_str(d, l.text)
+				sim.digest_u64(d, u64(l.job))
 			}
 		}
 	}
@@ -215,7 +113,7 @@ golden_run :: proc(level_id: string, script: []string, extra_ticks: int) -> u64 
 		drain(&w, &d)
 	}
 
-	digest_world(&w, &d)
+	sim.digest_world(&w, &d)
 	return d.h
 }
 

@@ -7,6 +7,7 @@ import "core:strings"
 import "campaign"
 import "input"
 import "shell"
+import "replay"
 import "save"
 import "sim"
 import "ui"
@@ -16,20 +17,38 @@ GRID_H :: 38
 
 SEED :: 0xCEF5EC
 
-// M2: jobs run in the background and the network notices you.
+// Written into every recording, so a replay attached to a bug report says which
+// build produced it. One field, no spaces -- it has to survive being a single
+// whitespace-separated token in the file.
+VERSION :: "m4-replay"
+
+// The frame loop, and the three things only it can do.
 //
 // The spine is unchanged from M0 -- seed -> world -> fixed-tick scheduler ->
-// event ring -> terminal -> grid -> CRT. M1 put a shell on top of it. M2 lets
-// several commands occupy that scheduler at once, and gives the world an
-// opinion about how loud you are being.
+// event ring -> terminal -> grid -> CRT. M1 put a shell on top of it, M2 let
+// several commands occupy the scheduler at once, M3 made it a campaign.
 //
-// Note what runs inside the tick loop rather than once per frame: advancing the
-// world, retiring jobs, and feeding scripted commands. Every one of those is a
-// decision about a particular tick, and running them per frame would make the
-// result depend on the frame rate.
+// What is left here is deliberately small. The inner tick loop moved to
+// shell.pump_frame, because a loop whose whole job is to be reproducible must
+// not exist in three copies -- this loop, the headless replay driver and the
+// tests all run the same one. Starting a level moved to shell.level_start for
+// the same reason.
+//
+// So main owns exactly what needs a window or a filesystem: polling input,
+// draining events into the terminal, drawing, writing the save, and writing or
+// reading a replay. Everything that decides *what happens at tick T* is now
+// somewhere a test can reach.
 
 main :: proc() {
 	opts := parse_args()
+
+	// Playing a replay opens no window. It is a verification run -- it either
+	// reproduces the recording or names the tick it stopped reproducing it -- and
+	// making it need a display would put it out of reach of exactly the machine
+	// most likely to want it, which is CI.
+	if len(opts.replay_path) > 0 {
+		os.exit(run_replay(opts.replay_path))
+	}
 
 	w: sim.World
 	if err := sim.world_init(&w, SEED); err != nil {
@@ -68,77 +87,73 @@ main :: proc() {
 
 	term: ui.Term
 
+	// Recording, when asked for. Created before the first level starts, because
+	// level_start is what opens a segment -- and allocated from the heap rather
+	// than the run arena, which world_reset frees at every transition.
+	journal: shell.Journal
+	recording := len(opts.record_path) > 0
+	if recording {
+		shell.journal_init(&journal, VERSION, campaign.catalogue_digest(), campaign.completed_ids(&progress))
+		sess.journal = &journal
+	}
+	defer if recording {
+		shell.journal_destroy(&journal)
+	}
+
 	// Start on the first unfinished level. A menu would be a second UI mode for
 	// no gain -- `levels` and `play` are commands, and the console is the game.
-	first, _ := campaign.next_level(&progress)
+	first, any_left := campaign.next_level(&progress)
+	if !any_left {
+		// Every level complete. Opening on the first one is the only sensible
+		// thing left, and beats dereferencing nil -- which is what happened here
+		// until someone finished the campaign.
+		first = &campaign.LEVELS[0]
+	}
 	start_level(&w, &sess, &term, &progress, first)
 
 	debriefed := false
 	debrief_pending := false
 
 	// Commands queued by --exec, fed in one at a time as the shell frees up.
-	next_queued := 0
+	feed := Exec_Feed {
+		cmds = opts.exec,
+	}
 
-	accumulator: f64
+	pump: shell.Pump
 
 	for !ui.app_should_close(&app) {
 		dt := ui.app_frame_time(&app)
 		ui.app_debug_keys(&app)
 
-		// Clamp before accumulating. Without this, one long stall (a breakpoint,
-		// a dragged window) queues thousands of ticks, which take longer to
-		// simulate than the stall did, which queues more -- the spiral of death.
-		accumulator += min(dt, 0.25)
-		for accumulator >= sim.TICK_DT {
-			sim.tick(&w)
-			// Inside the loop, not after it. Both of these are decisions about
-			// what happens at a particular tick; running them once per frame
-			// made the tick they landed on depend on the frame rate, which is
-			// exactly the frame-quantisation the determinism guarantee forbids.
-			shell.session_update(&sess)
+		// The whole inner tick loop lives in `shell` -- see pump.odin. It is the
+		// definition of what a tick is, and there are three callers of it now:
+		// this loop, the headless replay driver, and the tests. What it enforces
+		// that this loop did not is that ticking *stops* the instant a level
+		// change is pending: `play` is a builtin, so it can only record its
+		// intent, and the accumulator used to go on ticking the condemned world
+		// for up to fifteen more ticks -- running suspicion and trace, firing
+		// timers -- which is exactly the frame quantisation the determinism
+		// guarantee forbids.
+		shell.pump_frame(&pump, &sess, dt, shell.Tick_Hook{fn = feed_exec, user = &feed})
 
-			// Completion is *detected* here, inside the tick loop, because
-			// whether a level is finished at tick T must not depend on where
-			// the frame boundary fell -- and because anything deciding what to
-			// do next (the feeder below, a player typing `play`) has to see it
-			// immediately. Rendering the debrief is a separate, frame-timed
-			// concern; see below.
+		if pump.completed {
+			debriefed = true
+			debrief_pending = true
+			// Written the moment a level is finished rather than at exit, because
+			// the exits that matter -- a crash, a kill, closing the window
+			// mid-thought -- are exactly the ones that never reach an exit path.
 			//
-			// Held until everything has settled: the last objective often falls
-			// part-way through a tool's output, and a debrief landing mid-scan
-			// reads as though the game interrupted itself.
-			settled := !shell.session_active(&sess) && len(w.timers) == 0
-			if settled && !debriefed && sess.level != nil && campaign.level_complete(&w, sess.level) {
-				debriefed = true
-				debrief_pending = true
-				// Written the moment a level is finished rather than at exit,
-				// because the exits that matter -- a crash, a kill, closing the
-				// window mid-thought -- are exactly the ones that never reach an
-				// exit path.
-				if campaign.mark_complete(&progress, sess.level.id) && can_save && !opts.no_save {
-					// Reported, not swallowed. A campaign that silently stops
-					// recording is worse than one that never recorded at all,
-					// because the player only finds out when they come back.
-					if !save.write(progress_path, campaign.completed_ids(&progress)) {
-						fmt.eprintfln("warning: could not write progress to %s", progress_path)
-					}
+			// Out of the tick loop rather than in it: the detection is tick-exact
+			// (see pump_tick), and writing a file is the one thing that must not
+			// sit inside a loop whose timing everything else is measured against.
+			if pump.recorded && can_save && !opts.no_save {
+				// Reported, not swallowed. A campaign that silently stops
+				// recording is worse than one that never recorded at all, because
+				// the player only finds out when they come back.
+				if !save.write(progress_path, campaign.completed_ids(&progress)) {
+					fmt.eprintfln("warning: could not write progress to %s", progress_path)
 				}
 			}
-
-			// Feeding also stops while a level change is pending. `play` is a
-			// builtin, so it leaves the shell idle -- without this the next
-			// scripted command dispatches in the same tick, against the world
-			// the transition is about to replace. A human typing one command at
-			// a time never sees it; a scripted playthrough sees nothing else.
-			_, changing_level := sess.pending_transition.?
-			if next_queued < len(opts.exec) &&
-			   !shell.session_busy(&sess) &&
-			   !changing_level &&
-			   !sim.run_over(&w) {
-				shell.session_exec(&sess, opts.exec[next_queued])
-				next_queued += 1
-			}
-			accumulator -= sim.TICK_DT
 		}
 
 		for ev in ui.poll_input(&keys, dt) {
@@ -182,13 +197,29 @@ main :: proc() {
 		}
 
 		// The level change the shell asked for. Performed here because it frees
-		// the arena the session's own strings live in -- see start_level.
+		// the arena the session's own strings live in -- see shell.level_start.
+		//
+		// The level is named by id rather than by the number the player typed:
+		// numbers are positions in a list, and a list of sixty levels will be
+		// renumbered. A replay recorded against one numbering must not quietly
+		// transition somewhere else against another.
 		if t, wants := sess.pending_transition.?; wants {
 			sess.pending_transition = nil
-			if target, ok := campaign.level_by_number(t.level); ok {
+			if target, ok := campaign.level_by_id(t.level); ok {
+				if recording {
+					// The closing mark for the level being left, so the last thing
+					// it did is covered even though nothing scheduled a mark there.
+					shell.journal_mark(&sess)
+				}
 				start_level(&w, &sess, &term, &progress, target)
 				debriefed = false
 				debrief_pending = false
+				// Flushed at every transition as well as at exit. A recording is
+				// most valuable when the run ended in a way that never reached an
+				// exit path, which is precisely when a write-at-exit would lose it.
+				if recording {
+					write_replay(opts.record_path, &journal)
+				}
 				continue
 			}
 		}
@@ -204,6 +235,147 @@ main :: proc() {
 
 		free_all(context.temp_allocator)
 	}
+
+	if recording {
+		shell.journal_mark(&sess)
+		write_replay(opts.record_path, &journal)
+		fmt.printfln("wrote %s", opts.record_path)
+	}
+}
+
+// --- --exec -----------------------------------------------------------------
+
+// Commands queued by `--exec`, fed in one at a time as the shell frees up.
+//
+// This runs from inside the tick loop, at the point a dispatch decision belongs:
+// the tick a scripted command lands on must not depend on the frame rate.
+Exec_Feed :: struct {
+	cmds: []string,
+	next: int,
+}
+
+// Fed through session_submit_text -- the same door a player's Enter key goes
+// through -- rather than straight into session_exec.
+//
+// That matters for two reasons. The echo of a command is an *event*, so a
+// scripted session now reads back as a session rather than as bare output; and a
+// scripted session can be recorded, because recording hangs off that same door.
+// Feeding session_exec directly would produce a replay whose very first mark
+// disagreed with the recording that made it.
+feed_exec :: proc(user: rawptr, s: ^shell.Session) {
+	f := (^Exec_Feed)(user)
+	if f.next >= len(f.cmds) {
+		return
+	}
+	if shell.session_busy(s) || sim.run_over(s.world) {
+		return
+	}
+	// Feeding stops while a level change is pending. `play` is a builtin, so it
+	// leaves the shell idle -- without this the next scripted command dispatches
+	// in the same tick, against the world the transition is about to replace. A
+	// human typing one command at a time never sees it; a scripted playthrough
+	// sees nothing else.
+	if _, changing := s.pending_transition.?; changing {
+		return
+	}
+	shell.session_submit_text(s, f.cmds[f.next])
+	f.next += 1
+}
+
+// --- replays ----------------------------------------------------------------
+
+write_replay :: proc(path: string, j: ^shell.Journal) {
+	if !shell.journal_ok(j) {
+		// Said once per write rather than swallowed. A truncated recording is
+		// still a valid replay -- it simply stops early -- and a player who was
+		// not told would replay it and wonder where their session went.
+		fmt.eprintfln("warning: %s stops early -- the recording outgrew the format's limits", path)
+	}
+	text, err := replay.format(shell.journal_replay(j), context.temp_allocator)
+	if err != .None {
+		fmt.eprintfln("warning: could not write %s: %s", path, replay.error_text(err))
+		return
+	}
+	if e := os.write_entire_file(path, transmute([]byte)text); e != nil {
+		fmt.eprintfln("warning: could not write %s", path)
+	}
+}
+
+// Plays a replay and reports. Returns the process exit code: 0 reproduced, 1
+// diverged, 2 the file could not be read at all.
+//
+// The distinction matters for CI. A file that will not parse is a broken input;
+// a file that parses and diverges is a broken build, and those two must not look
+// the same to whoever is reading the log.
+run_replay :: proc(path: string) -> int {
+	data, read_err := os.read_entire_file(path, context.allocator)
+	if read_err != nil {
+		fmt.eprintfln("could not read %s", path)
+		return 2
+	}
+	defer delete(data)
+
+	rep, perr, line := replay.parse(string(data))
+	if perr != .None {
+		if line > 0 {
+			fmt.eprintfln("%s:%d: %s", path, line, replay.error_text(perr))
+		} else {
+			fmt.eprintfln("%s: %s", path, replay.error_text(perr))
+		}
+		return 2
+	}
+	defer replay.destroy(&rep)
+
+	// Said before a tick is played, because otherwise the only symptom of a
+	// content edit is a digest mismatch several hundred ticks in -- which reads
+	// exactly like a determinism regression and is not one.
+	if have := campaign.catalogue_digest(); have != rep.catalogue {
+		fmt.eprintfln("note: the campaign catalogue has changed since this replay was recorded")
+		fmt.eprintfln("      recorded against %016x, this build is %016x", rep.catalogue, have)
+		fmt.eprintfln("      a divergence below may be a content edit rather than a regression")
+	}
+
+	w: sim.World
+	if err := sim.world_init(&w, SEED); err != nil {
+		fmt.eprintln("failed to allocate world arena:", err)
+		return 2
+	}
+	defer sim.world_destroy(&w)
+
+	prog: campaign.Progress
+	campaign.progress_init(&prog)
+	defer campaign.progress_destroy(&prog)
+
+	sess: shell.Session
+	pb := shell.Playback {
+		mode = .Verify,
+	}
+	shell.replay_run(&w, &sess, &prog, &rep, &pb)
+
+	if pb.ok {
+		fmt.printfln(
+			"%s reproduced: %d segment(s), %d entries, %d marks verified",
+			path,
+			pb.segments_played,
+			pb.entries_played,
+			pb.marks_checked,
+		)
+		return 0
+	}
+
+	fmt.eprintfln(
+		"%s DIVERGED in segment %d (%s) at tick %d (T+%.2fs): %s",
+		path,
+		pb.segment,
+		pb.level,
+		u64(pb.tick),
+		sim.tick_seconds(pb.tick),
+		shell.divergence_text(pb.why),
+	)
+	if pb.why == .Events_Digest || pb.why == .World_Digest {
+		fmt.eprintfln("  recorded %016x, this build produced %016x", pb.want, pb.got)
+	}
+	return 1
 }
 
 // --- arguments --------------------------------------------------------------
@@ -212,6 +384,11 @@ Options :: struct {
 	shot:    Autoshot,
 	exec:    []string,
 	no_save: bool, // play without reading or writing progress
+
+	// `--record <file>` writes what you did, tick by tick, with digests.
+	// `--replay <file>` plays one back headlessly and checks every digest.
+	record_path: string,
+	replay_path: string,
 }
 
 // `--shot <seconds> [path]` runs to a fixed point on the sim clock, writes a
@@ -265,6 +442,28 @@ parse_args :: proc() -> Options {
 				}
 				opts.exec = cleaned[:]
 			}
+
+		// A replay is what --exec cannot be. It carries the tick each command
+		// landed on, so waiting is expressible; it carries interrupts, which have
+		// no command line at all; it carries the progress it was recorded against,
+		// because what is unlocked changes what commands do; and it carries
+		// digests, so unlike a script it knows what the right answer was.
+		case "--record":
+			if i + 1 < len(args) {
+				i += 1
+				opts.record_path = args[i]
+			}
+
+		case "--replay":
+			if i + 1 < len(args) {
+				i += 1
+				opts.replay_path = args[i]
+			}
+
+		// Documented in the README since progress persistence landed, and never
+		// actually parsed -- the field existed and nothing ever set it.
+		case "--no-save":
+			opts.no_save = true
 		}
 	}
 	return opts
@@ -764,14 +963,16 @@ load_progress :: proc(p: ^campaign.Progress, path: string) {
 
 // Starting or restarting a level, and the one place it may happen.
 //
-// The order below is not stylistic. `ui.Term` stores string *references* into
-// the run arena (a deliberate M0 choice -- sim log text outlives the
-// scrollback, so copying would be waste), and Session.user/cwd/line.history are
-// arena-allocated too. sim.world_reset frees that arena. So every holder of an
-// arena pointer must be emptied *before* the reset, and rebound after it.
+// The work itself is shell.level_start -- it moved there so that the headless
+// replay driver starts a level by exactly the same steps in exactly the same
+// order, rather than by a second procedure that claims to. A replay that entered
+// a level built slightly differently would diverge on its first mark after the
+// transition, and nothing in the report would point back here.
 //
-// Doing this from inside a shell command would free the session mid-dispatch,
-// which is why commands only record the intent and this runs between frames.
+// What stays is the one part that is presentation: `ui.Term` stores string
+// *references* into the run arena (a deliberate M0 choice -- sim log text
+// outlives the scrollback, so copying would be waste), and world_reset frees
+// that arena. So the terminal must be emptied before anything else happens.
 start_level :: proc(
 	w: ^sim.World,
 	sess: ^shell.Session,
@@ -780,56 +981,7 @@ start_level :: proc(
 	level: ^campaign.Level,
 ) {
 	ui.term_clear(term) // drop every dangling reference first
-	sim.world_reset(w, SEED)
-
-	origin := level.build(w)
-	shell.session_init(sess, w, origin, "operator")
-
-	sess.level = level
-	sess.progress = progress
-	sess.tools = level.tools
-	sess.slots = level.slots if level.slots > 0 else shell.SLOTS_DEFAULT
-	progress.current = level.id
-
-	// Trace is per-level: the early levels teach one idea at a time, and a
-	// beginner meeting a rising detection meter in level one learns neither.
-	// Disabling it means leaving every segment unwatched, which is the same
-	// mechanism as the player's own VPS being free.
-	if !level.trace {
-		it: int
-		for sn in sim.pool_iter(&w.subnets, &it) {
-			sn.monitoring = .None
-		}
-	}
-
-	brief(w, level)
-}
-
-brief :: proc(w: ^sim.World, level: ^campaign.Level) {
-	sim.log_line(w, fmt.aprintf("LEVEL %d  --  %s", level.number, level.title, allocator = w.allocator), .Heading)
-
-	for tech in level.techniques {
-		sim.log_line(
-			w,
-			fmt.aprintf("ATT&CK  %s  %s", tech.id, tech.name, allocator = w.allocator),
-			.Info,
-		)
-	}
-	if len(level.techniques) > 0 {
-		sim.log_line(
-			w,
-			fmt.aprintf("tactic  %s", campaign.tactic_name(level.techniques[0].tactic), allocator = w.allocator),
-			.Info,
-		)
-	}
-
-	sim.log_line(w, "", .Plain)
-	for line in level.brief {
-		sim.log_line(w, line, .Plain)
-	}
-	sim.log_line(w, "", .Plain)
-	sim.log_line(w, "`objectives` to see your goals, `help` for what you can run.", .Info)
-	sim.log_line(w, "", .Plain)
+	shell.level_start(sess, w, progress, level, SEED)
 }
 
 // Said once, when the last required objective falls. The teaching payload: the
