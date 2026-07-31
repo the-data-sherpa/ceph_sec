@@ -47,11 +47,18 @@ if ! command -v "$ODIN" >/dev/null 2>&1; then
     elif [ -x "$HOME/.local/odin/odin" ]; then
         ODIN="$HOME/.local/odin/odin"
     else
-        echo "error: 'odin' not found on PATH. See README.md for setup." >&2
-        exit 1
+        # Not an error yet. `gate` is pure shell over the source text and needs
+        # no toolchain at all -- that is the entire reason CI runs it as its own
+        # job, so a gate violation is reported in seconds rather than after a
+        # compiler install. Failing here made that job impossible: it died on a
+        # missing compiler it was never going to invoke.
+        ODIN_MISSING=1
     fi
 fi
 
+# Everything a compiler-using target needs, checked at the point of use rather
+# than at startup, so `gate` can run with no toolchain present at all.
+#
 # Odin drives the system linker through clang on Linux and macOS. clang is not
 # actually required for that job -- it is invoked as a linker frontend, and gcc
 # accepts the same flags -- so fall back rather than making clang a hard
@@ -61,16 +68,22 @@ fi
 # branch: there Odin drives link.exe (or lld) and never looks for clang, so a
 # Windows host with neither clang nor gcc installed is entirely normal. Running
 # this check there would have failed the build on a perfectly good toolchain.
-if [ "$HOST_OS" != windows ]; then
-    if [ -z "${ODIN_CLANG_PATH:-}" ] && ! command -v clang >/dev/null 2>&1; then
-        if command -v gcc >/dev/null 2>&1; then
-            export ODIN_CLANG_PATH=gcc
-        else
-            echo "error: neither clang nor gcc found; Odin needs one to link." >&2
-            exit 1
+require_toolchain() {
+    if [ "${ODIN_MISSING:-0}" = 1 ]; then
+        echo "error: 'odin' not found on PATH. See README.md for setup." >&2
+        exit 1
+    fi
+    if [ "$HOST_OS" != windows ]; then
+        if [ -z "${ODIN_CLANG_PATH:-}" ] && ! command -v clang >/dev/null 2>&1; then
+            if command -v gcc >/dev/null 2>&1; then
+                export ODIN_CLANG_PATH=gcc
+            else
+                echo "error: neither clang nor gcc found; Odin needs one to link." >&2
+                exit 1
+            fi
         fi
     fi
-fi
+}
 
 # Packages that must remain incapable of touching the outside world.
 #
@@ -322,6 +335,7 @@ STUB
 }
 
 do_check() {
+    require_toolchain
     echo "checking:"
     "$ODIN" check src/input -no-entry-point
     echo "  src/input ....... ok"
@@ -363,6 +377,7 @@ do_check() {
 CHECK_TARGETS="windows_amd64 darwin_amd64 darwin_arm64 linux_arm64"
 
 do_check_targets() {
+    require_toolchain
     echo "cross-checking src:"
     local t
     for t in $CHECK_TARGETS; do
@@ -372,11 +387,13 @@ do_check_targets() {
 }
 
 do_test() {
+    require_toolchain
     mkdir -p "$OUT_DIR"
     "$ODIN" test tests -out:"$OUT_DIR/sim_tests$EXE"
 }
 
 do_build() {
+    require_toolchain
     mkdir -p "$OUT_DIR"
     case "$1" in
         # -no-bounds-check is deliberately absent. It was here for speed that a
