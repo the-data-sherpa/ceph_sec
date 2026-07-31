@@ -1,0 +1,30 @@
+# Ceph.Sec replay.
+#
+# `cephsec --replay <this file>` plays it back and checks every mark. A mark
+# is the event digest and the world digest at the end of that tick; if either
+# differs, playback stops and says which, and when.
+#
+# Ticks are 60 to the second and restart at zero for each segment, because a
+# level transition resets the world clock. '#' starts a comment only as the
+# first character of a line.
+cephsec-replay 1
+game m4-replay
+catalogue 879300ddc9d0ca82
+
+segment recon-sweep cef5ec
+at 30 cmd nmap -sn 10.0.4.0/24
+at 300 mark c23d7981af3fca4f 15833f3318a9bc69
+at 600 mark c23d7981af3fca4f 8f5755785005c8bc
+at 900 mark c23d7981af3fca4f 37542a9ea377437b
+at 900 cmd objectives
+at 960 cmd play 2
+at 960 mark 973d62b31b871b4d 1b135148247c74f7
+
+segment recon-versions cef5ec
+at 30 cmd nmap -sV 10.0.7.0/24
+at 300 mark ba90c5a2e09d2769 be2fc777f4925235
+at 600 mark 4afc7c2254f640fc a318d35165be9a65
+at 900 mark 4afc7c2254f640fc 44b698bc899fc706
+at 900 cmd hint
+at 960 cmd techniques
+at 960 mark 76eda191351cefaa 1547f8d130284962

@@ -629,7 +629,9 @@ test_play_accepts_an_unlocked_level :: proc(t: ^testing.T) {
 	transition, wants := p.sess.pending_transition.?
 	testing.expect(t, wants, "play should schedule the transition once unlocked")
 	if wants {
-		testing.expect_value(t, transition.level, 2)
+		// The id, not the number: renumbering the catalogue must not silently
+		// change which level a recorded transition goes to.
+		testing.expect_value(t, transition.level, "recon-versions")
 		testing.expect(t, !transition.retry)
 	}
 }
@@ -665,7 +667,7 @@ test_retry_schedules_the_current_level :: proc(t: ^testing.T) {
 	transition, wants := p.sess.pending_transition.?
 	testing.expect(t, wants, "retry should schedule a transition")
 	if wants {
-		testing.expect_value(t, transition.level, level.number)
+		testing.expect_value(t, transition.level, level.id)
 		testing.expect(t, transition.retry, "and mark it as a retry")
 	}
 }

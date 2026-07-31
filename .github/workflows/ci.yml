@@ -152,6 +152,28 @@ jobs:
       - name: Release build
         run: bash ./build.sh release
 
+      # The regression corpus, played through the shipping binary rather than
+      # through the test harness.
+      #
+      # `odin test` already plays these -- see tests/replay_corpus_test.odin --
+      # but through the debug build and the test allocator. Playing them through
+      # the optimised binary is what catches a divergence that only exists under
+      # -o:speed, which is the build a player actually runs.
+      #
+      # This sits in the matrix rather than in `smoke` deliberately: it is
+      # headless, so it costs nothing to run everywhere, and "the same replay
+      # reproduces bit-for-bit on Linux, macOS and Windows" is the strongest
+      # determinism claim this project can make. It is also the one claim nobody
+      # here can check by hand -- there is no Mac and no Windows box in reach.
+      - name: Replay the regression corpus
+        run: |
+          set -euo pipefail
+          bin=build/cephsec
+          [ "$RUNNER_OS" = Windows ] && bin=build/cephsec.exe
+          for f in tests/replays/*.replay; do
+            "./$bin" --replay "$f"
+          done
+
   # A binary that only works from the repository root is one nobody else can
   # run -- and for three milestones this one silently lost its shader when
   # moved, which looked like a design choice rather than a bug. Copying it
@@ -171,7 +193,14 @@ jobs:
   # --shot 2 frame.png` prints its display metrics, and this step can grow.
   smoke:
     name: relocated binary renders (linux only)
-    needs: build-and-test
+    # `needs: gate`, NOT `needs: build-and-test`. This is the only job that
+    # opens a window, compiles the CRT shader and renders a frame -- the check
+    # that caught the binary silently losing its shader for three milestones.
+    # `needs` waits for the whole matrix, and the macOS and Windows legs have
+    # never run, so hanging this off build-and-test would let one red leg on an
+    # untested platform silently skip the rendering check. It re-installs Odin
+    # and rebuilds release itself, so it has no data dependency on the matrix.
+    needs: gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

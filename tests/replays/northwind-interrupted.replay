@@ -1,0 +1,38 @@
+# Ceph.Sec replay.
+#
+# `cephsec --replay <this file>` plays it back and checks every mark. A mark
+# is the event digest and the world digest at the end of that tick; if either
+# differs, playback stops and says which, and when.
+#
+# Ticks are 60 to the second and restart at zero for each segment, because a
+# level transition resets the world clock. '#' starts a comment only as the
+# first character of a line.
+cephsec-replay 1
+game m4-replay
+catalogue 879300ddc9d0ca82
+progress recon-sweep
+progress recon-versions
+progress access-exposure
+progress lateral-reuse
+
+segment northwind cef5ec
+at 60 cmd nmap -sV 10.0.4.0/24
+at 300 mark 9891251a38b05a52 fd46865e917ee650
+at 300 intr
+at 600 mark df551bd8216b4d3e 54d321058d3aa305
+at 900 mark df551bd8216b4d3e 81b83491a8cfe173
+at 900 cmd trace
+at 1200 mark 05a82cf59d6616f3 6cd1139861b8cd58
+at 1500 mark 05a82cf59d6616f3 6548484f3d449c87
+at 1800 mark 05a82cf59d6616f3 96cadf0e7822c3d9
+at 2100 mark 05a82cf59d6616f3 3d76a82f0a990298
+at 2400 mark 05a82cf59d6616f3 81a74ee0c690513f
+at 2400 cmd nmap -sn 10.0.4.0/24
+at 2700 mark 12e425cdf629e0fc e0071090f195fc10
+at 3000 mark 12e425cdf629e0fc f5661af5e4df6aa2
+at 3000 cmd curl http://10.0.4.11/
+at 3300 mark 70b3c7ddeeeeef18 243c7590b26573fa
+at 3600 mark 70b3c7ddeeeeef18 4bdc974a43586558
+at 3900 mark 70b3c7ddeeeeef18 163b377a1aaebd1f
+at 3900 cmd objectives
+at 3900 mark c50d683013736e67 163b377a1aaebd1f

@@ -11,6 +11,14 @@ package sim
 //
 // Not cryptographic, and not trying to be. Statistically solid and fast is the
 // entire requirement.
+//
+// AN HONEST NOTE ON SEEDS. Nothing outside this file draws from it. All five
+// levels are hand-authored, so today two different seeds produce byte-identical
+// runs and a shared seed communicates nothing. A replay records the seed anyway,
+// because it costs a hex number and because the guarantee above is the sort that
+// has to be in place before it is needed rather than after -- but "same seed,
+// same run" is currently true in the uninteresting direction, and no part of
+// this project should claim otherwise until something actually rolls.
 
 Rng :: struct {
 	state: u64,
