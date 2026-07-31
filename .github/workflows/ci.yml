@@ -149,6 +149,20 @@ jobs:
       # missing framework or an unresolved symbol is precisely the sort of
       # portability break that only appears at link time. It needs a toolchain,
       # not a display, so it is safe on a headless runner.
+      #
+      # raylib links against X11 and GL, and the ubuntu runner ships neither set
+      # of development libraries -- `cannot find -lX11`. These are link-time
+      # dependencies only; the test suites above need none of them, which is why
+      # 204 tests pass on a runner that cannot yet produce a binary. macOS links
+      # its own frameworks and Windows the vendored .lib, so neither needs this.
+      - name: Install X11 and GL headers (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libgl1-mesa-dev
+
       - name: Release build
         run: bash ./build.sh release
 
@@ -222,11 +236,18 @@ jobs:
           tar -xzf "$RUNNER_TEMP/odin.tar.gz" --strip-components=1 -C ~/.local/odin
           chmod +x ~/.local/odin/odin
 
+      # xvfb for the display, and the X11/GL development libraries because this
+      # job builds the binary itself rather than taking one from the matrix --
+      # raylib will not link without them.
+      - name: Install X11, GL and xvfb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libgl1-mesa-dev xvfb
+
       - name: Release build
         run: ./build.sh release
-
-      - name: Install xvfb
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
 
       - name: Smoke-test the binary outside the repo
         run: |

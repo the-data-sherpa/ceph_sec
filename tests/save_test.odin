@@ -13,13 +13,34 @@ import "../src/save"
 // intact rather than losing a campaign, so the failure paths get more attention
 // here than the happy one.
 
+// A scratch path for this suite, on whichever platform is running it.
+//
+// This used to fall back to a hardcoded "/tmp", which does not exist on
+// Windows: os.write_entire_file then failed, load correctly reported Missing,
+// and the assertion that a newer save is refused failed against a file that had
+// never been written. It surfaced the first time CI ran the Windows leg -- the
+// suite had been passing for four milestones on the only platform it could
+// address. The failure was intermittent, too: the tests that go through
+// save.write create their parent directory on the way past, so whether a
+// sibling test found the path already present depended on thread scheduling.
 @(private)
 temp_save :: proc(name: string) -> string {
-	dir := os.get_env("TMPDIR", context.temp_allocator)
-	if dir == "" {
-		dir = "/tmp"
+	when ODIN_OS == .Windows {
+		dir := os.get_env("TEMP", context.temp_allocator)
+		if dir == "" {
+			dir = os.get_env("TMP", context.temp_allocator)
+		}
+		if dir == "" {
+			dir = "C:\\Windows\\Temp"
+		}
+		return strings.concatenate({dir, "\\cephsec-test-", name, ".txt"}, context.temp_allocator)
+	} else {
+		dir := os.get_env("TMPDIR", context.temp_allocator)
+		if dir == "" {
+			dir = "/tmp"
+		}
+		return strings.concatenate({dir, "/cephsec-test-", name, ".txt"}, context.temp_allocator)
 	}
-	return strings.concatenate({dir, "/cephsec-test-", name, ".txt"}, context.temp_allocator)
 }
 
 @(private)
